@@ -24,7 +24,7 @@ This document supports a hands-on walkthrough of the **M1 Settlement contract su
 | Chain ID | `84532` |
 | Public RPC | `https://sepolia.base.org` |
 | Explorer | `https://sepolia.basescan.org` |
-| `Settlement` address | `0xE0B9f9398641E5398Ba5377417eEed3B01c7313C` |
+| `Settlement` address | [`0xE0B9f9398641E5398Ba5377417eEed3B01c7313C`](https://sepolia.basescan.org/address/0xe0b9f9398641e5398ba5377417eeed3b01c7313c#code) — source verified |
 | Deploy TX | `0x762ca21b3e0bf23d1c896b0fc8b8b0701cf3d9aa4cc2994aea38076f81c1915d` |
 | Deployer (also admin) | `0x190D8A377cA64b95b199E8f2b3Ca7cA5D1B41BA1` |
 | `USDC` reference | `0x036CbD53842c5426634e7929541eC2318f3dCF7e` (Circle Sepolia USDC) |
