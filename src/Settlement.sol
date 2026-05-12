@@ -104,10 +104,14 @@ contract Settlement is AccessControl, ReentrancyGuard {
 
     // ─── M1 implemented surface ──────────────────────────────────────────────────────────────────
 
-    /// @notice Commits a Proof of Intent (PoI) and creates a settlement-layer transaction record.
+    /// @notice Commits a Proof of Intent (PoI), pulls escrow from the originator, and creates a
+    ///         settlement-layer transaction record.
     /// @dev Records the locked-at-PoI time windows on the transaction so subsequent admin updates
     ///      to the defaults do not retroactively change windows for already-committed transactions.
-    ///      Escrow pull (USDC.safeTransferFrom from the originator) is delivered in M2.
+    ///      Escrow is pulled via `USDC.safeTransferFrom`; the originator must have approved this
+    ///      contract for at least `input.escrowAmount` prior to the call. The transfer is the last
+    ///      action in the function (Checks-Effects-Interactions) and reverts the entire call on
+    ///      failure, leaving no half-committed state behind.
     /// @param input PoI input bundle (beneficiary, eligible claimant, direction, amount, MoMo hash).
     /// @return stid The derived 32-byte SawaSwap Transaction ID.
     function commitPoI(PoIInput calldata input) external nonReentrant returns (bytes32 stid) {
@@ -146,6 +150,8 @@ contract Settlement is AccessControl, ReentrancyGuard {
         emit PoICommitted(
             stid, msg.sender, input.beneficiary, input.direction, input.escrowAmount, tw.tw1, tw.tw2, tw.tw3
         );
+
+        USDC.safeTransferFrom(msg.sender, address(this), input.escrowAmount);
     }
 
     /// @notice Returns the stored transaction record for a given STID.

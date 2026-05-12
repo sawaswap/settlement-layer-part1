@@ -33,6 +33,9 @@ contract SettlementTest is Test {
         settlement = new Settlement(
             IERC20(address(usdc)), admin, TimeWindows({tw1: DEFAULT_TW1, tw2: DEFAULT_TW2, tw3: DEFAULT_TW3})
         );
+        // Default fixture: originator is funded and pre-approved for ten default commits' worth of
+        // escrow. Tests that need to test the un-approved path (or insufficient balance) override.
+        _fundAndApprove(originator, DEFAULT_AMOUNT * 10);
     }
 
     // ─── 1. Deployment ───────────────────────────────────────────────────────────────────────────
@@ -202,6 +205,71 @@ contract SettlementTest is Test {
         assertEq(txn.tw3, DEFAULT_TW3, "tw3 must be locked at PoI");
     }
 
+    // ─── 6.5 Escrow lock at PoI (M2 — §D.2.3 D4 "Escrow locks at transaction creation / PoI commitment") ─
+
+    /// @dev Happy path: a pre-approved originator commits, contract balance rises by `escrowAmount`,
+    ///      originator balance falls by the same amount.
+    function test_EscrowLock_LocksOnCommit() public {
+        uint256 originatorBefore = usdc.balanceOf(originator);
+        uint256 contractBefore = usdc.balanceOf(address(settlement));
+
+        vm.prank(originator);
+        settlement.commitPoI(_defaultInput());
+
+        assertEq(usdc.balanceOf(originator), originatorBefore - DEFAULT_AMOUNT, "originator balance must drop");
+        assertEq(usdc.balanceOf(address(settlement)), contractBefore + DEFAULT_AMOUNT, "contract balance must rise");
+    }
+
+    /// @dev Locked amount equals the `escrowAmount` field of the PoI input exactly, including for
+    ///      a non-default amount.
+    function test_EscrowLock_AmountMatchesInput() public {
+        uint256 customAmount = 42_345_678; // 42.345678 USDC
+        _fundAndApprove(stranger, customAmount);
+
+        PoIInput memory input = _defaultInput();
+        input.escrowAmount = customAmount;
+
+        uint256 contractBefore = usdc.balanceOf(address(settlement));
+
+        vm.prank(stranger);
+        bytes32 stid = settlement.commitPoI(input);
+
+        assertEq(usdc.balanceOf(address(settlement)) - contractBefore, customAmount, "locked delta must equal input");
+
+        Transaction memory txn = settlement.getTransaction(stid);
+        assertEq(txn.escrowAmount, customAmount, "stored escrowAmount must equal input");
+    }
+
+    /// @dev Without prior allowance, `commitPoI` reverts on the `safeTransferFrom` call and no
+    ///      transaction record persists (full revert via CEI ordering and `nonReentrant`).
+    function test_EscrowLock_RevertsWithoutAllowance() public {
+        // `stranger` has neither balance nor allowance.
+        PoIInput memory input = _defaultInput();
+
+        vm.prank(stranger);
+        vm.expectRevert(); // SafeERC20 wraps the underlying ERC20InsufficientAllowance / -Balance.
+        settlement.commitPoI(input);
+
+        // Nonce must not have moved (state changes reverted alongside the failing external call).
+        assertEq(settlement.getNonce(stranger), 0, "nonce must not increment on reverted commitPoI");
+    }
+
+    /// @dev Two successful commits from the same originator each lock independently; contract
+    ///      balance equals the sum of both `escrowAmount`s and each STID exists.
+    function test_EscrowLock_AccumulatesAcrossCommits() public {
+        uint256 contractBefore = usdc.balanceOf(address(settlement));
+
+        vm.startPrank(originator);
+        bytes32 stid1 = settlement.commitPoI(_defaultInput());
+        bytes32 stid2 = settlement.commitPoI(_defaultInput());
+        vm.stopPrank();
+
+        assertTrue(stid1 != stid2, "STIDs must differ across commits");
+        assertEq(usdc.balanceOf(address(settlement)) - contractBefore, DEFAULT_AMOUNT * 2, "balance must equal sum");
+        assertTrue(settlement.transactionExists(stid1));
+        assertTrue(settlement.transactionExists(stid2));
+    }
+
     // ─── 7. Zero-amount revert ───────────────────────────────────────────────────────────────────
 
     function test_CommitPoI_RevertsOnZeroAmount() public {
@@ -297,5 +365,14 @@ contract SettlementTest is Test {
             escrowAmount: DEFAULT_AMOUNT,
             momoLegHash: DEFAULT_MOMO_HASH
         });
+    }
+
+    /// @dev Mints `amount` of USDC to `user` and sets allowance for the Settlement contract to the
+    ///      same amount. Used by every commit-path test; tests of the un-funded / un-approved path
+    ///      simply skip the call.
+    function _fundAndApprove(address user, uint256 amount) internal {
+        usdc.mint(user, amount);
+        vm.prank(user);
+        usdc.approve(address(settlement), amount);
     }
 }
