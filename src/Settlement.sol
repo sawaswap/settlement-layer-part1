@@ -142,6 +142,9 @@ contract Settlement is AccessControl, ReentrancyGuard {
     ///      contract for at least `input.escrowAmount` prior to the call. The transfer is the last
     ///      action in the function (Checks-Effects-Interactions) and reverts the entire call on
     ///      failure, leaving no half-committed state behind.
+    /// @dev Transitions the transaction into v0.11.2 §3 escrow [1] — the persisted lifecycle marker
+    ///      indicating escrow is held in Settlement Layer custody. Escrow remains at [1] until
+    ///      terminal finality moves it exactly once.
     /// @param input PoI input bundle (beneficiary, eligible claimant, direction, amount, MoMo hash).
     /// @return stid The derived 32-byte SawaSwap Transaction ID.
     function commitPoI(PoIInput calldata input) external nonReentrant returns (bytes32 stid) {
