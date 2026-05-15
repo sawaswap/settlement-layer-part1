@@ -12,11 +12,13 @@ import {STID} from "./libraries/STID.sol";
 /// @title Settlement — SawaSwap Settlement Layer (Part 1)
 /// @notice Implements the Part 1 state machine of the SawaSwap protocol (Core Protocol v0.11.2):
 ///         PoI commitment, escrow accounting, time-window storage, claim admissibility, DRP boundary.
-/// @dev M1 scope is the on-chain skeleton: state enum, transaction storage, `commitPoI`, getters, and
-///      admin-restricted time-window configuration. Escrow movement, PoR/claim handling, DRP
-///      invocation, and terminal-state transitions are stubbed (revert with `NotImplementedM1`) and
-///      are delivered in M2. Production deployment guards (Section E of the Agreement) are gated to
-///      a separate phase beyond Part 1.
+/// @dev M1 delivered the on-chain skeleton: state enum, transaction storage, `commitPoI`, getters,
+///      and admin-restricted time-window configuration. M2 progressively replaces the M2 stubs:
+///      PR #3 added escrow lock on `commitPoI`; PR #4 adds `submitPoR` and the Settled finality
+///      path; PR #5–#7 will add TW1/TW2/TW3 expiry, claim handling, and the DRP boundary. External
+///      `settle` / `reverse` recovery hatches remain stubbed pending bilateral confirmation of
+///      their intended semantics. Production deployment guards (Section E of the Agreement) are
+///      gated to a separate phase beyond Part 1.
 contract Settlement is AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -41,6 +43,12 @@ contract Settlement is AccessControl, ReentrancyGuard {
 
     /// @dev Per-originator nonce for STID derivation; ensures uniqueness across repeat originators.
     mapping(address originator => uint256 nonce) private _nonce;
+
+    /// @dev Hash of the PoR payload submitted for a given STID (zero if no PoR has been submitted).
+    ///      Stored as a secondary mapping rather than a `Transaction` field to preserve the M1 ABI
+    ///      of the struct. The raw payload is not retained on-chain — indexers reconstruct it from
+    ///      the originating transaction's calldata.
+    mapping(bytes32 stid => bytes32 porHash) private _porHash;
 
     // ─── M1 events ───────────────────────────────────────────────────────────────────────────────
 
@@ -83,6 +91,28 @@ contract Settlement is AccessControl, ReentrancyGuard {
     error InvalidTimeWindow();
     error InvalidAddress();
 
+    /// @notice Thrown when an operation is attempted from an incompatible state.
+    /// @param expected The state required by the operation's precondition.
+    /// @param actual   The state recorded for the targeted transaction.
+    error InvalidState(uint8 expected, uint8 actual);
+
+    /// @notice Thrown when the relevant time window for an operation has already elapsed.
+    error WindowExpired();
+
+    /// @notice Thrown when `msg.sender` is not the address permitted to submit a PoR for this STID.
+    /// @dev The PoR submitter is the off-chain receiver, recorded on-chain as `eligibleClaimant`
+    ///      at PoI commitment (v0.11.2 §C.2 and §5–§7).
+    error NotPoRSubmitter();
+
+    /// @notice Thrown when PoR payload bytes are empty or otherwise structurally invalid.
+    /// @dev M2 enforces only the non-empty precondition. Semantic validation of the payload is
+    ///      out of Part-1 scope and deferred to the off-chain pipeline / DRP layer.
+    error InvalidPoRData();
+
+    /// @notice Thrown when a finalisation helper is invoked on a transaction whose escrow has
+    ///         already been moved (single-move invariant).
+    error AlreadyFinalized();
+
     // ─── Construction ────────────────────────────────────────────────────────────────────────────
 
     /// @param usdc                 ERC-20 token contract used for escrow (USDC on the target chain).
@@ -104,10 +134,17 @@ contract Settlement is AccessControl, ReentrancyGuard {
 
     // ─── M1 implemented surface ──────────────────────────────────────────────────────────────────
 
-    /// @notice Commits a Proof of Intent (PoI) and creates a settlement-layer transaction record.
+    /// @notice Commits a Proof of Intent (PoI), pulls escrow from the originator, and creates a
+    ///         settlement-layer transaction record.
     /// @dev Records the locked-at-PoI time windows on the transaction so subsequent admin updates
     ///      to the defaults do not retroactively change windows for already-committed transactions.
-    ///      Escrow pull (USDC.safeTransferFrom from the originator) is delivered in M2.
+    ///      Escrow is pulled via `USDC.safeTransferFrom`; the originator must have approved this
+    ///      contract for at least `input.escrowAmount` prior to the call. The transfer is the last
+    ///      action in the function (Checks-Effects-Interactions) and reverts the entire call on
+    ///      failure, leaving no half-committed state behind.
+    /// @dev Transitions the transaction into v0.11.2 §3 escrow [1] — the persisted lifecycle marker
+    ///      indicating escrow is held in Settlement Layer custody. Escrow remains at [1] until
+    ///      terminal finality moves it exactly once.
     /// @param input PoI input bundle (beneficiary, eligible claimant, direction, amount, MoMo hash).
     /// @return stid The derived 32-byte SawaSwap Transaction ID.
     function commitPoI(PoIInput calldata input) external nonReentrant returns (bytes32 stid) {
@@ -146,6 +183,8 @@ contract Settlement is AccessControl, ReentrancyGuard {
         emit PoICommitted(
             stid, msg.sender, input.beneficiary, input.direction, input.escrowAmount, tw.tw1, tw.tw2, tw.tw3
         );
+
+        USDC.safeTransferFrom(msg.sender, address(this), input.escrowAmount);
     }
 
     /// @notice Returns the stored transaction record for a given STID.
@@ -175,6 +214,12 @@ contract Settlement is AccessControl, ReentrancyGuard {
         return _nonce[originator];
     }
 
+    /// @notice Returns the hash of the PoR payload submitted for a given STID, or `bytes32(0)` if
+    ///         no PoR has been submitted.
+    function getPoRHash(bytes32 stid) external view returns (bytes32) {
+        return _porHash[stid];
+    }
+
     // ─── Parameter Configuration Carve-Out (§C.3.7) ──────────────────────────────────────────────
 
     /// @notice Updates the default TW1 / TW2 / TW3 used for new commitments.
@@ -194,12 +239,43 @@ contract Settlement is AccessControl, ReentrancyGuard {
         emit RailPairProfileSet(railPairId, tw1, msg.sender);
     }
 
-    // ─── M2 stubs ────────────────────────────────────────────────────────────────────────────────
+    // ─── M2 implemented surface ──────────────────────────────────────────────────────────────────
 
-    /// @notice [M2] Submit Proof of Receipt (PoR). Reverts in M1.
-    function submitPoR(bytes32, bytes calldata) external pure {
-        revert NotImplementedM1();
+    /// @notice Submit a Proof of Receipt (PoR) for an in-flight transaction, settling it.
+    /// @dev Implements the happy path of v0.11.2 §3 / §5–§7: a valid PoR submitted within TW1
+    ///      drives the transaction from `PoICommitted` to `Settled` atomically, releasing escrow
+    ///      to the on-chain beneficiary. M2 validates only that the payload is non-empty; semantic
+    ///      verification of the payload is deferred to the off-chain pipeline / DRP layer and is
+    ///      out of Part-1 scope. The submitter must be the `eligibleClaimant` recorded at PoI
+    ///      commitment, which is the off-chain receiver (CMM → User C, MMC → Agent B per §C.2);
+    ///      this is the interpretation derived from §5–§7 and is documented as a PR-level
+    ///      assumption ready to be revisited if the Client confirms a different reading.
+    /// @param stid    Transaction identifier returned by `commitPoI`.
+    /// @param porData PoR payload bytes; only `keccak256(porData)` is retained on-chain.
+    function submitPoR(bytes32 stid, bytes calldata porData) external nonReentrant {
+        if (!_exists[stid]) revert TransactionNotFound();
+        if (porData.length == 0) revert InvalidPoRData();
+
+        Transaction storage txn = _txs[stid];
+        if (txn.state != State.PoICommitted) {
+            revert InvalidState(uint8(State.PoICommitted), uint8(txn.state));
+        }
+        // Time-window enforcement against `block.timestamp`. Validator-side manipulation is bounded
+        // to a few seconds on Base and is dwarfed by TW1 / TW2 / TW3 (minutes-to-hours scale), so
+        // direct comparison is sound here.
+        // forge-lint: disable-next-line(incorrect-shift)
+        // forge-lint: disable-next-line(unsafe-typecast)
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp > uint256(txn.committedAt) + uint256(txn.tw1)) revert WindowExpired();
+        if (msg.sender != txn.eligibleClaimant) revert NotPoRSubmitter();
+
+        _porHash[stid] = keccak256(porData);
+        emit PoRSubmitted(stid);
+
+        _finalizeSettled(stid);
     }
+
+    // ─── M2 stubs ────────────────────────────────────────────────────────────────────────────────
 
     /// @notice [M2] Submit a claim against a transaction. Reverts in M1.
     function submitClaim(bytes32, bytes calldata) external pure {
@@ -224,5 +300,26 @@ contract Settlement is AccessControl, ReentrancyGuard {
     /// @notice [M2] Reverse an in-flight transaction (return escrow to originator). Reverts in M1.
     function reverse(bytes32) external pure {
         revert NotImplementedM1();
+    }
+
+    // ─── Internal finalisation helpers ───────────────────────────────────────────────────────────
+
+    /// @dev Drives a transaction to the `Settled` terminal state and releases escrow to the
+    ///      beneficiary. Strict Checks-Effects-Interactions: state mutation and `terminalMoved`
+    ///      flag are set before the external `safeTransfer`, and the single-move invariant is
+    ///      enforced by the `AlreadyFinalized` guard at entry. Callers must hold `nonReentrant`
+    ///      at the external entry point.
+    function _finalizeSettled(bytes32 stid) internal {
+        Transaction storage txn = _txs[stid];
+        if (txn.terminalMoved) revert AlreadyFinalized();
+
+        State previous = txn.state;
+        txn.state = State.Settled;
+        txn.terminalMoved = true;
+
+        emit StateChanged(stid, previous, State.Settled);
+        emit Settled(stid, txn.beneficiary, txn.escrowAmount);
+
+        USDC.safeTransfer(txn.beneficiary, txn.escrowAmount);
     }
 }

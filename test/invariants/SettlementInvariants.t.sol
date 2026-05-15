@@ -22,7 +22,7 @@ contract SettlementInvariants is Test {
         settlement = new Settlement(
             IERC20(address(usdc)), address(this), TimeWindows({tw1: 30 minutes, tw2: 12 hours, tw3: 48 hours})
         );
-        handler = new SettlementHandler(settlement);
+        handler = new SettlementHandler(settlement, usdc);
 
         targetContract(address(handler));
 
@@ -80,5 +80,16 @@ contract SettlementInvariants is Test {
             assertEq(txn.tw2, handler.expectedTW2(stid), "tw2 must be locked at PoI");
             assertEq(txn.tw3, handler.expectedTW3(stid), "tw3 must be locked at PoI");
         }
+    }
+
+    /// @dev P3' — Escrow accounting. The Settlement contract's USDC balance must equal the sum of
+    ///      every active escrow (= every successful commitPoI), since M1+PR3 has no terminal-state
+    ///      transitions that would release escrow. Once submit-PoR / claim / DRP land in later PRs,
+    ///      this invariant generalises to `balance == Σ active escrows` where terminalMoved txns
+    ///      no longer count toward the active set.
+    function invariant_escrowBalanceEqualsTotalLocked() public view {
+        assertEq(
+            usdc.balanceOf(address(settlement)), handler.totalLocked(), "USDC balance must equal sum of locked escrows"
+        );
     }
 }

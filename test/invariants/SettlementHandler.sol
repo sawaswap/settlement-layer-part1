@@ -5,13 +5,16 @@ import {Test} from "forge-std/Test.sol";
 
 import {Settlement} from "../../src/Settlement.sol";
 import {Direction, PoIInput, TimeWindows} from "../../src/types/Types.sol";
+import {MockERC20} from "../mocks/MockERC20.sol";
 
-/// @title SettlementHandler — bounded driver for the Settlement Layer invariant suite (M1)
+/// @title SettlementHandler — bounded driver for the Settlement Layer invariant suite
 /// @notice The handler is the only contract the invariant fuzzer is permitted to call. It accepts
-///         random inputs from Foundry, bounds them into a meaningful range, calls `commitPoI`, and
-///         records the inputs so the invariants can compare stored state against expected state.
+///         random inputs from Foundry, bounds them into a meaningful range, mints + approves USDC
+///         for the random sender, calls `commitPoI`, and records the inputs so the invariants can
+///         compare stored state against expected state.
 contract SettlementHandler is Test {
     Settlement public immutable settlement;
+    MockERC20 public immutable usdc;
 
     bytes32[] public stids;
     mapping(bytes32 stid => uint256 amount) public expectedAmount;
@@ -19,11 +22,13 @@ contract SettlementHandler is Test {
     mapping(bytes32 stid => uint64 tw2) public expectedTW2;
     mapping(bytes32 stid => uint64 tw3) public expectedTW3;
 
+    uint256 public totalLocked;
     uint256 public commitAttempts;
     uint256 public commitSuccesses;
 
-    constructor(Settlement settlement_) {
+    constructor(Settlement settlement_, MockERC20 usdc_) {
         settlement = settlement_;
+        usdc = usdc_;
     }
 
     function commitPoI_bounded(
@@ -42,6 +47,12 @@ contract SettlementHandler is Test {
         if (claimant == address(0)) claimant = address(0xC1A1);
         if (sender == address(0)) sender = address(0xCAFE);
 
+        // Fund and approve the random sender so the escrow pull succeeds. Done unconditionally —
+        // even if the commit reverts on another precondition, the spare allowance is harmless.
+        usdc.mint(sender, amount);
+        vm.prank(sender);
+        usdc.approve(address(settlement), amount);
+
         TimeWindows memory tw = settlement.getDefaultTimeWindows();
 
         PoIInput memory input = PoIInput({
@@ -55,6 +66,7 @@ contract SettlementHandler is Test {
             expectedTW1[stid] = tw.tw1;
             expectedTW2[stid] = tw.tw2;
             expectedTW3[stid] = tw.tw3;
+            totalLocked += amount;
             commitSuccesses++;
         } catch {
             // tolerated under fail_on_revert = false
