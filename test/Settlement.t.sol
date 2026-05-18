@@ -651,6 +651,162 @@ contract SettlementTest is Test {
         assertEq(usdc.balanceOf(address(settlement)), 0, "no escrow remains in contract after default-reverse");
     }
 
+    /// @dev Empty `claimData` is rejected at the structural-validation gate, before the lazy
+    ///      escalate or any other state mutation. Reverts `InvalidClaimData`.
+    function test_SubmitClaim_RevertsOnEmptyClaimData() public {
+        vm.prank(originator);
+        bytes32 stid = settlement.commitPoI(_defaultInput());
+
+        vm.warp(block.timestamp + DEFAULT_TW1 + 1);
+
+        vm.prank(claimant);
+        vm.expectRevert(Settlement.InvalidClaimData.selector);
+        settlement.submitClaim(stid, "");
+
+        Transaction memory txn = settlement.getTransaction(stid);
+        assertEq(uint8(txn.state), uint8(State.PoICommitted), "state must not advance on rejected call");
+    }
+
+    /// @dev Existence sentinel: unknown STID → `TransactionNotFound`. Mirrors the M1-era pattern
+    ///      applied uniformly across every M2 external entry.
+    function test_SubmitClaim_RevertsOnUnknownStid() public {
+        vm.prank(claimant);
+        vm.expectRevert(Settlement.TransactionNotFound.selector);
+        settlement.submitClaim(bytes32(uint256(0xdeadbeef)), _defaultClaimData());
+    }
+
+    /// @dev Window guard: once TW1 + TW2 has elapsed without a prior claim, the eligible claimant
+    ///      can no longer file the first claim — the path is closed and the transaction must
+    ///      default-reverse via `expireTW2`. Reverts `WindowExpired`; the lazy escalate side
+    ///      effect rolls back together with the revert.
+    function test_SubmitClaim_RevertsAfterTW2Expiry() public {
+        vm.prank(originator);
+        bytes32 stid = settlement.commitPoI(_defaultInput());
+
+        vm.warp(block.timestamp + DEFAULT_TW1 + DEFAULT_TW2 + 1);
+
+        vm.prank(claimant);
+        vm.expectRevert(Settlement.WindowExpired.selector);
+        settlement.submitClaim(stid, _defaultClaimData());
+
+        Transaction memory txn = settlement.getTransaction(stid);
+        assertEq(uint8(txn.state), uint8(State.PoICommitted), "revert rolls back lazy escalate");
+        assertEq(settlement.getClaimHash(stid), bytes32(0));
+    }
+
+    /// @dev Single-submit invariant: a second `submitClaim` after the first reverts
+    ///      `ClaimAlreadyExists`. Subsequent modifications must go through `updateClaim`.
+    ///      Originally-stored claim hash is preserved.
+    function test_SubmitClaim_RevertsOnDuplicate() public {
+        vm.prank(originator);
+        bytes32 stid = settlement.commitPoI(_defaultInput());
+
+        vm.warp(block.timestamp + DEFAULT_TW1 + 1);
+        vm.prank(claimant);
+        settlement.submitClaim(stid, _defaultClaimData());
+
+        bytes memory secondClaim = bytes("second-claim-attempt");
+        vm.prank(claimant);
+        vm.expectRevert(Settlement.ClaimAlreadyExists.selector);
+        settlement.submitClaim(stid, secondClaim);
+
+        assertEq(
+            settlement.getClaimHash(stid),
+            keccak256(_defaultClaimData()),
+            "first claim hash preserved on duplicate-submit revert"
+        );
+    }
+
+    /// @dev Symmetric empty-payload guard on `updateClaim`. Reverts `InvalidClaimData`.
+    function test_UpdateClaim_RevertsOnEmptyClaimData() public {
+        vm.prank(originator);
+        bytes32 stid = settlement.commitPoI(_defaultInput());
+
+        vm.warp(block.timestamp + DEFAULT_TW1 + 1);
+        vm.prank(claimant);
+        settlement.submitClaim(stid, _defaultClaimData());
+
+        vm.prank(claimant);
+        vm.expectRevert(Settlement.InvalidClaimData.selector);
+        settlement.updateClaim(stid, "");
+
+        assertEq(settlement.getClaimHash(stid), keccak256(_defaultClaimData()), "original claim hash preserved");
+    }
+
+    /// @dev Symmetric existence guard on `updateClaim`. Reverts `TransactionNotFound`.
+    function test_UpdateClaim_RevertsOnUnknownStid() public {
+        vm.prank(claimant);
+        vm.expectRevert(Settlement.TransactionNotFound.selector);
+        settlement.updateClaim(bytes32(uint256(0xdeadbeef)), _defaultClaimData());
+    }
+
+    /// @dev Symmetric eligibility guard on `updateClaim`. A stranger cannot mutate the claim hash
+    ///      even after the eligible claimant has filed the initial submission. Reverts
+    ///      `NotEligibleClaimant`; the previously-stored claim hash is preserved.
+    function test_UpdateClaim_RevertsWhenCallerNotEligibleClaimant() public {
+        vm.prank(originator);
+        bytes32 stid = settlement.commitPoI(_defaultInput());
+
+        vm.warp(block.timestamp + DEFAULT_TW1 + 1);
+        vm.prank(claimant);
+        settlement.submitClaim(stid, _defaultClaimData());
+
+        vm.prank(stranger);
+        vm.expectRevert(Settlement.NotEligibleClaimant.selector);
+        settlement.updateClaim(stid, bytes("stranger-tampering-attempt"));
+
+        assertEq(settlement.getClaimHash(stid), keccak256(_defaultClaimData()), "original claim hash preserved");
+    }
+
+    /// @dev Window guard on `expireTW2`. Before the TW1 + TW2 absolute window has elapsed, the
+    ///      default-reverse path is not yet eligible to fire and the poker reverts
+    ///      `EscalationNotDue`. The lazy escalate from `PoICommitted` rolls back with the revert
+    ///      so state remains `PoICommitted`. Same shape as `pokeTW1`'s before-window revert.
+    function test_ExpireTW2_RevertsBeforeTW2Expiry() public {
+        vm.prank(originator);
+        bytes32 stid = settlement.commitPoI(_defaultInput());
+
+        // Past TW1 but not past TW1+TW2.
+        vm.warp(block.timestamp + DEFAULT_TW1 + 1);
+
+        vm.prank(stranger);
+        vm.expectRevert(Settlement.EscalationNotDue.selector);
+        settlement.expireTW2(stid);
+
+        Transaction memory txn = settlement.getTransaction(stid);
+        assertEq(uint8(txn.state), uint8(State.PoICommitted), "revert rolls back lazy escalate");
+    }
+
+    /// @dev Claim-aware guard on `expireTW2`. When a claim exists at TW2 expiry, the
+    ///      default-reverse path is preempted by the DRP route (`invokeDRP` in PR #7) and
+    ///      `expireTW2` reverts `ClaimPending` to surface the misuse.
+    function test_ExpireTW2_RevertsWhenClaimExists() public {
+        vm.prank(originator);
+        bytes32 stid = settlement.commitPoI(_defaultInput());
+
+        vm.warp(block.timestamp + DEFAULT_TW1 + 1);
+        vm.prank(claimant);
+        settlement.submitClaim(stid, _defaultClaimData());
+
+        // Advance past TW1 + TW2 absolute window.
+        vm.warp(block.timestamp + DEFAULT_TW2 + 1);
+
+        vm.prank(stranger);
+        vm.expectRevert(Settlement.ClaimPending.selector);
+        settlement.expireTW2(stid);
+
+        Transaction memory txn = settlement.getTransaction(stid);
+        assertEq(uint8(txn.state), uint8(State.EscalationL1), "state remains EscalationL1 - DRP path pending");
+        assertFalse(txn.terminalMoved, "terminalMoved must remain false - no escrow movement");
+        assertEq(settlement.getClaimHash(stid), keccak256(_defaultClaimData()), "claim hash preserved");
+    }
+
+    /// @dev Symmetric existence guard on `expireTW2`. Reverts `TransactionNotFound`.
+    function test_ExpireTW2_RevertsOnUnknownStid() public {
+        vm.expectRevert(Settlement.TransactionNotFound.selector);
+        settlement.expireTW2(bytes32(uint256(0xdeadbeef)));
+    }
+
     // ─── 7. Zero-amount revert ───────────────────────────────────────────────────────────────────
 
     function test_CommitPoI_RevertsOnZeroAmount() public {
