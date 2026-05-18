@@ -15,11 +15,12 @@ import {STID} from "./libraries/STID.sol";
 /// @dev M1 delivered the on-chain skeleton: state enum, transaction storage, `commitPoI`, getters,
 ///      and admin-restricted time-window configuration. M2 progressively replaces the M2 stubs:
 ///      PR #3 added escrow lock on `commitPoI`; PR #4 added `submitPoR` and the Settled finality
-///      path; PR #5 adds TW1 expiry escalation via `pokeTW1`; PR #6–#7 will add TW2/TW3 expiry,
-///      claim handling, and the DRP boundary. External
-///      `settle` / `reverse` recovery hatches remain stubbed pending bilateral confirmation of
-///      their intended semantics. Production deployment guards (Section E of the Agreement) are
-///      gated to a separate phase beyond Part 1.
+///      path; PR #5 added TW1 expiry escalation via `pokeTW1`; PR #6 adds claim handling
+///      (`submitClaim` / `updateClaim`) and TW2 default-reverse via `expireTW2`; PR #7 will add
+///      the DRP boundary and TW3 expiry. The external `settle` / `reverse` recovery hatches are
+///      retained as M1 stubs reverting `NotImplementedM1()` per the 15 May ratified decision
+///      to drop them as unreachable under SafeERC20 atomic-revert semantics. Production deployment
+///      guards (Section E of the Agreement) are gated to a separate phase beyond Part 1.
 contract Settlement is AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -50,6 +51,13 @@ contract Settlement is AccessControl, ReentrancyGuard {
     ///      of the struct. The raw payload is not retained on-chain — indexers reconstruct it from
     ///      the originating transaction's calldata.
     mapping(bytes32 stid => bytes32 porHash) private _porHash;
+
+    /// @dev Hash of the most recently submitted (or updated) claim payload for a given STID (zero
+    ///      if no claim has been submitted). As with `_porHash`, the raw payload lives off-chain
+    ///      and indexers reconstruct it from calldata. The mapping is updated in place by
+    ///      `updateClaim` so only the latest claim version is on-chain — earlier versions are
+    ///      reachable via the historical `ClaimSubmitted` / `ClaimUpdated` event sequence.
+    mapping(bytes32 stid => bytes32 claimHash) private _claimHash;
 
     // ─── M1 events ───────────────────────────────────────────────────────────────────────────────
 
@@ -114,9 +122,35 @@ contract Settlement is AccessControl, ReentrancyGuard {
     ///         already been moved (single-move invariant).
     error AlreadyFinalized();
 
-    /// @notice Thrown when an escalation poker (pokeTW1 / future expireTW2 / expireTW3) is invoked
+    /// @notice Thrown when an escalation poker (pokeTW1 / expireTW2 / expireTW3) is invoked
     ///         before the relevant window has elapsed.
     error EscalationNotDue();
+
+    /// @notice Thrown when `msg.sender` is not the address permitted to submit or update a claim
+    ///         for this STID.
+    /// @dev The eligible claimant is recorded at PoI commitment as `Transaction.eligibleClaimant`
+    ///      and is the off-chain receiver (CMM → User C, MMC → Agent B per v0.11.2 §C.2 / §5–§7).
+    error NotEligibleClaimant();
+
+    /// @notice Thrown when the claim payload bytes are empty or otherwise structurally invalid.
+    /// @dev M2 enforces only the non-empty precondition. Semantic validation of the payload is
+    ///      out of Part-1 scope and deferred to the off-chain pipeline / DRP layer.
+    error InvalidClaimData();
+
+    /// @notice Thrown when `submitClaim` is invoked on a transaction that already has a claim on
+    ///         record. The eligible claimant should call `updateClaim` instead while the TW2
+    ///         window is still open.
+    error ClaimAlreadyExists();
+
+    /// @notice Thrown when `updateClaim` is invoked on a transaction that does not yet have a
+    ///         claim on record. `submitClaim` must be called first.
+    error NoClaimToUpdate();
+
+    /// @notice Thrown when `expireTW2` is invoked on a transaction that already has a claim on
+    ///         record. The default-reverse path is reserved for transactions where the eligible
+    ///         claimant chose not to file a claim within TW2; once a claim exists the path forward
+    ///         is the DRP boundary (`invokeDRP`, PR #7), not the default-reverse poker.
+    error ClaimPending();
 
     // ─── Construction ────────────────────────────────────────────────────────────────────────────
 
@@ -225,6 +259,12 @@ contract Settlement is AccessControl, ReentrancyGuard {
         return _porHash[stid];
     }
 
+    /// @notice Returns the hash of the most recently submitted (or updated) claim payload for a
+    ///         given STID, or `bytes32(0)` if no claim has been submitted.
+    function getClaimHash(bytes32 stid) external view returns (bytes32) {
+        return _claimHash[stid];
+    }
+
     // ─── Parameter Configuration Carve-Out (§C.3.7) ──────────────────────────────────────────────
 
     /// @notice Updates the default TW1 / TW2 / TW3 used for new commitments.
@@ -307,29 +347,123 @@ contract Settlement is AccessControl, ReentrancyGuard {
         emit StateChanged(stid, previous, State.EscalationL1);
     }
 
+    /// @notice Submit a claim against an in-flight transaction whose TW1 has expired without a
+    ///         valid PoR. Lazy-escalates from `PoICommitted` → `EscalationL1` if the TW1 window
+    ///         has elapsed and the explicit `pokeTW1` (PR #5) has not yet fired.
+    /// @dev Implements the eligible-claimant predicate of v0.11.2 §3 / §4. Claim payload semantics
+    ///      are out of Part-1 scope; M2 stores only `keccak256(claimData)` and emits the raw
+    ///      payload's presence through `ClaimSubmitted` for indexers, which reconstruct content
+    ///      from the originating transaction's calldata. The two-stage claim lifecycle
+    ///      (`submitClaim` then optional `updateClaim`) keeps the on-chain footprint to one slot
+    ///      while preserving the off-chain editable surface that the spec allows during TW2.
+    /// @param stid      Transaction identifier returned by `commitPoI`.
+    /// @param claimData Claim payload bytes; only `keccak256(claimData)` is retained on-chain.
+    function submitClaim(bytes32 stid, bytes calldata claimData) external nonReentrant {
+        if (!_exists[stid]) revert TransactionNotFound();
+        if (claimData.length == 0) revert InvalidClaimData();
+
+        _expireTW1IfDue(stid);
+
+        Transaction storage txn = _txs[stid];
+        if (txn.state != State.EscalationL1) {
+            revert InvalidState(uint8(State.EscalationL1), uint8(txn.state));
+        }
+        if (msg.sender != txn.eligibleClaimant) revert NotEligibleClaimant();
+        // Window check mirrors the validator-drift-bounded comparison used elsewhere; TW2 is on
+        // the hours scale and dwarfs validator timestamp manipulation by several orders of magnitude.
+        // forge-lint: disable-next-line(incorrect-shift)
+        // forge-lint: disable-next-line(unsafe-typecast)
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp > uint256(txn.committedAt) + uint256(txn.tw1) + uint256(txn.tw2)) {
+            revert WindowExpired();
+        }
+        if (_claimHash[stid] != bytes32(0)) revert ClaimAlreadyExists();
+
+        _claimHash[stid] = keccak256(claimData);
+        emit ClaimSubmitted(stid, msg.sender);
+    }
+
+    /// @notice Update the claim payload for an in-flight transaction while the TW2 window is open.
+    /// @dev Preserves the spec's "before claim acceptance" mutability window: the eligible
+    ///      claimant may refine or correct the claim payload at any time within TW2 (and before
+    ///      DRP invocation in PR #7 — that path is gated separately by the `EscalationL1` state
+    ///      guard, which fails once `invokeDRP` transitions to `EscalationL2_DRP`). Only the
+    ///      latest claim hash is retained on-chain; the historical revision chain is reconstructed
+    ///      off-chain from the `ClaimSubmitted` / `ClaimUpdated` event sequence.
+    /// @param stid      Transaction identifier returned by `commitPoI`.
+    /// @param claimData New claim payload bytes; only `keccak256(claimData)` is retained on-chain.
+    function updateClaim(bytes32 stid, bytes calldata claimData) external nonReentrant {
+        if (!_exists[stid]) revert TransactionNotFound();
+        if (claimData.length == 0) revert InvalidClaimData();
+
+        Transaction storage txn = _txs[stid];
+        if (txn.state != State.EscalationL1) {
+            revert InvalidState(uint8(State.EscalationL1), uint8(txn.state));
+        }
+        if (msg.sender != txn.eligibleClaimant) revert NotEligibleClaimant();
+        // forge-lint: disable-next-line(incorrect-shift)
+        // forge-lint: disable-next-line(unsafe-typecast)
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp > uint256(txn.committedAt) + uint256(txn.tw1) + uint256(txn.tw2)) {
+            revert WindowExpired();
+        }
+        if (_claimHash[stid] == bytes32(0)) revert NoClaimToUpdate();
+
+        _claimHash[stid] = keccak256(claimData);
+        emit ClaimUpdated(stid);
+    }
+
+    /// @notice Permissionless trigger that default-reverses a transaction once TW2 has elapsed
+    ///         without a claim on record. Returns escrow to the originator atomically with the
+    ///         terminal-state transition.
+    /// @dev v0.11.2 §3 / §4 — the default-reverse path is reserved for transactions where the
+    ///      eligible claimant chose not to file a claim within TW2. If a claim does exist when
+    ///      TW2 elapses, the resolution path is the DRP boundary (`invokeDRP` in PR #7), not
+    ///      this poker — `expireTW2` reverts `ClaimPending` in that case to surface the misuse.
+    ///      Permissionless to keep liveness independent of any single party; same posture as
+    ///      `pokeTW1` (PR #5). The lazy `_expireTW1IfDue` at entry lets a single call drive a
+    ///      no-PoR no-claim transaction from `PoICommitted` directly to `Reversed` once both
+    ///      windows have elapsed — observers see both `StateChanged` events in one tx, preserving
+    ///      the lifecycle audit trail.
+    function expireTW2(bytes32 stid) external nonReentrant {
+        if (!_exists[stid]) revert TransactionNotFound();
+
+        _expireTW1IfDue(stid);
+
+        Transaction storage txn = _txs[stid];
+        if (txn.state != State.EscalationL1) {
+            revert InvalidState(uint8(State.EscalationL1), uint8(txn.state));
+        }
+        // forge-lint: disable-next-line(incorrect-shift)
+        // forge-lint: disable-next-line(unsafe-typecast)
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp <= uint256(txn.committedAt) + uint256(txn.tw1) + uint256(txn.tw2)) {
+            revert EscalationNotDue();
+        }
+        if (_claimHash[stid] != bytes32(0)) revert ClaimPending();
+
+        _finalizeReversed(stid);
+    }
+
     // ─── M2 stubs ────────────────────────────────────────────────────────────────────────────────
-
-    /// @notice [M2] Submit a claim against a transaction. Reverts in M1.
-    function submitClaim(bytes32, bytes calldata) external pure {
-        revert NotImplementedM1();
-    }
-
-    /// @notice [M2] Update an in-flight claim before the TW2 window closes. Reverts in M1.
-    function updateClaim(bytes32, bytes calldata) external pure {
-        revert NotImplementedM1();
-    }
 
     /// @notice [M2] Invoke the Dispute Resolution Protocol. Reverts in M1.
     function invokeDRP(bytes32) external pure {
         revert NotImplementedM1();
     }
 
-    /// @notice [M2] Settle an in-flight transaction (release escrow to beneficiary). Reverts in M1.
+    /// @notice [M2] Retained as a reverting stub per the 15 May ratified decision to drop the
+    ///         external recovery-hatch track. Always reverts `NotImplementedM1`.
+    /// @dev SafeERC20 reverts atomically on transfer failure, so the "terminal state reached but
+    ///      escrow not moved" condition is unreachable in the implemented finalisation helpers
+    ///      (`_finalizeSettled` / `_finalizeReversed`); the recovery hatches have no observable
+    ///      path to fire and are kept only as ABI placeholders to avoid a breaking selector change.
     function settle(bytes32) external pure {
         revert NotImplementedM1();
     }
 
-    /// @notice [M2] Reverse an in-flight transaction (return escrow to originator). Reverts in M1.
+    /// @notice [M2] Retained as a reverting stub per the 15 May ratified decision to drop the
+    ///         external recovery-hatch track. Always reverts `NotImplementedM1`. See `settle`.
     function reverse(bytes32) external pure {
         revert NotImplementedM1();
     }
@@ -353,5 +487,46 @@ contract Settlement is AccessControl, ReentrancyGuard {
         emit Settled(stid, txn.beneficiary, txn.escrowAmount);
 
         USDC.safeTransfer(txn.beneficiary, txn.escrowAmount);
+    }
+
+    /// @dev Drives a transaction to the `Reversed` terminal state and returns escrow to the
+    ///      originator. Mirrors `_finalizeSettled` exactly under strict Checks-Effects-Interactions:
+    ///      state mutation and `terminalMoved` are set before the external `safeTransfer`, and the
+    ///      single-move invariant is enforced by the `AlreadyFinalized` guard at entry. Consumed by
+    ///      `expireTW2` (TW2 default-reverse, PR #6) and by `invokeDRP` (DRP-Reversed outcome,
+    ///      PR #7) plus `expireTW3` (TW3 default-reverse, PR #7). Callers must hold `nonReentrant`
+    ///      at the external entry point.
+    function _finalizeReversed(bytes32 stid) internal {
+        Transaction storage txn = _txs[stid];
+        if (txn.terminalMoved) revert AlreadyFinalized();
+
+        State previous = txn.state;
+        txn.state = State.Reversed;
+        txn.terminalMoved = true;
+
+        emit StateChanged(stid, previous, State.Reversed);
+        emit Reversed(stid, txn.originator, txn.escrowAmount);
+
+        USDC.safeTransfer(txn.originator, txn.escrowAmount);
+    }
+
+    /// @dev Lazy auto-escalator consumed by `submitClaim`. If the transaction is still in
+    ///      `PoICommitted` and TW1 has elapsed, transitions to `EscalationL1` and emits
+    ///      `StateChanged`; otherwise no-op. This preserves the spec's *"eligible claimant may
+    ///      file a claim once TW1 expires"* contract without forcing claimants to first call
+    ///      `pokeTW1` (PR #5) — the two surfaces (explicit poker and lazy escalation) co-exist
+    ///      and converge on the same `EscalationL1` state. Callers must hold `nonReentrant` at the
+    ///      external entry point.
+    function _expireTW1IfDue(bytes32 stid) internal {
+        Transaction storage txn = _txs[stid];
+        if (txn.state != State.PoICommitted) return;
+        // forge-lint: disable-next-line(incorrect-shift)
+        // forge-lint: disable-next-line(unsafe-typecast)
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp <= uint256(txn.committedAt) + uint256(txn.tw1)) return;
+
+        State previous = txn.state;
+        txn.state = State.EscalationL1;
+        emit StateChanged(stid, previous, State.EscalationL1);
     }
 }
