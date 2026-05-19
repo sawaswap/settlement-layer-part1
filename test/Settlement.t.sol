@@ -758,6 +758,26 @@ contract SettlementTest is Test {
         assertEq(settlement.getClaimHash(stid), keccak256(_defaultClaimData()), "original claim hash preserved");
     }
 
+    /// @dev Claim-presence guard on `updateClaim`. Once `pokeTW1` (PR #5) has driven the state to
+    ///      `EscalationL1` but no prior `submitClaim` has fired, the eligible claimant cannot
+    ///      `updateClaim` directly — `submitClaim` must come first. Reverts `NoClaimToUpdate`.
+    function test_UpdateClaim_RevertsWhenNoPriorClaim() public {
+        vm.prank(originator);
+        bytes32 stid = settlement.commitPoI(_defaultInput());
+
+        vm.warp(block.timestamp + DEFAULT_TW1 + 1);
+
+        // Drive state to EscalationL1 via the permissionless TW1 poker without filing a claim.
+        vm.prank(stranger);
+        settlement.pokeTW1(stid);
+
+        vm.prank(claimant);
+        vm.expectRevert(Settlement.NoClaimToUpdate.selector);
+        settlement.updateClaim(stid, _defaultClaimData());
+
+        assertEq(settlement.getClaimHash(stid), bytes32(0), "no claim hash recorded on rejected updateClaim");
+    }
+
     /// @dev Window guard on `expireTW2`. Before the TW1 + TW2 absolute window has elapsed, the
     ///      default-reverse path is not yet eligible to fire and the poker reverts
     ///      `EscalationNotDue`. The lazy escalate from `PoICommitted` rolls back with the revert
