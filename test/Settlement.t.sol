@@ -436,6 +436,69 @@ contract SettlementTest is Test {
         assertEq(usdc.balanceOf(address(settlement)), DEFAULT_AMOUNT, "first commit's escrow must still be locked");
     }
 
+    // ─── 6.8 TW1 expiry escalation (M2 — §D.2.3 D5 "TW1 expiry without valid PoR opens escalation path") ─
+
+    /// @dev Before TW1 elapses, no party — claimant, originator, or stranger — can escalate.
+    ///      The poker reverts `EscalationNotDue` and the transaction stays in `PoICommitted`.
+    function test_PokeTW1_RevertsBeforeTW1Expiry() public {
+        vm.prank(originator);
+        bytes32 stid = settlement.commitPoI(_defaultInput());
+
+        vm.prank(stranger);
+        vm.expectRevert(Settlement.EscalationNotDue.selector);
+        settlement.pokeTW1(stid);
+
+        Transaction memory txn = settlement.getTransaction(stid);
+        assertEq(uint8(txn.state), uint8(State.PoICommitted), "state must remain PoICommitted before TW1 expiry");
+    }
+
+    /// @dev Any caller may drive the escalation once TW1 has elapsed. The transition emits
+    ///      `StateChanged(PoICommitted, EscalationL1)` and leaves `terminalMoved` / `drpInvoked`
+    ///      untouched — no escrow has moved and the DRP has not been invoked.
+    function test_PokeTW1_TransitionsToEscalationL1AfterExpiry() public {
+        vm.prank(originator);
+        bytes32 stid = settlement.commitPoI(_defaultInput());
+
+        vm.warp(block.timestamp + DEFAULT_TW1 + 1);
+
+        vm.expectEmit(true, true, true, true);
+        emit Settlement.StateChanged(stid, State.PoICommitted, State.EscalationL1);
+        vm.prank(stranger);
+        settlement.pokeTW1(stid);
+
+        Transaction memory txn = settlement.getTransaction(stid);
+        assertEq(uint8(txn.state), uint8(State.EscalationL1), "state must advance to EscalationL1");
+        assertFalse(txn.terminalMoved, "terminalMoved must remain false - no escrow movement on escalation");
+        assertFalse(txn.drpInvoked, "drpInvoked must remain false - DRP not invoked on escalation");
+    }
+
+    /// @dev Once escalated, the transaction is no longer in `PoICommitted`; a second poke reverts
+    ///      `InvalidState(PoICommitted, EscalationL1)`. This is the same shape `submitPoR` uses
+    ///      for its state guard.
+    function test_PokeTW1_RevertsFromNonPoICommittedState() public {
+        vm.prank(originator);
+        bytes32 stid = settlement.commitPoI(_defaultInput());
+
+        vm.warp(block.timestamp + DEFAULT_TW1 + 1);
+
+        vm.prank(stranger);
+        settlement.pokeTW1(stid);
+
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Settlement.InvalidState.selector, uint8(State.PoICommitted), uint8(State.EscalationL1)
+            )
+        );
+        settlement.pokeTW1(stid);
+    }
+
+    /// @dev Existence sentinel applies uniformly across M2 entries: unknown STID → `TransactionNotFound`.
+    function test_PokeTW1_RevertsOnUnknownStid() public {
+        vm.expectRevert(Settlement.TransactionNotFound.selector);
+        settlement.pokeTW1(bytes32(uint256(0xdeadbeef)));
+    }
+
     // ─── 7. Zero-amount revert ───────────────────────────────────────────────────────────────────
 
     function test_CommitPoI_RevertsOnZeroAmount() public {

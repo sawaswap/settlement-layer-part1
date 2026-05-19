@@ -14,8 +14,9 @@ import {STID} from "./libraries/STID.sol";
 ///         PoI commitment, escrow accounting, time-window storage, claim admissibility, DRP boundary.
 /// @dev M1 delivered the on-chain skeleton: state enum, transaction storage, `commitPoI`, getters,
 ///      and admin-restricted time-window configuration. M2 progressively replaces the M2 stubs:
-///      PR #3 added escrow lock on `commitPoI`; PR #4 adds `submitPoR` and the Settled finality
-///      path; PR #5–#7 will add TW1/TW2/TW3 expiry, claim handling, and the DRP boundary. External
+///      PR #3 added escrow lock on `commitPoI`; PR #4 added `submitPoR` and the Settled finality
+///      path; PR #5 adds TW1 expiry escalation via `pokeTW1`; PR #6–#7 will add TW2/TW3 expiry,
+///      claim handling, and the DRP boundary. External
 ///      `settle` / `reverse` recovery hatches remain stubbed pending bilateral confirmation of
 ///      their intended semantics. Production deployment guards (Section E of the Agreement) are
 ///      gated to a separate phase beyond Part 1.
@@ -112,6 +113,10 @@ contract Settlement is AccessControl, ReentrancyGuard {
     /// @notice Thrown when a finalisation helper is invoked on a transaction whose escrow has
     ///         already been moved (single-move invariant).
     error AlreadyFinalized();
+
+    /// @notice Thrown when an escalation poker (pokeTW1 / future expireTW2 / expireTW3) is invoked
+    ///         before the relevant window has elapsed.
+    error EscalationNotDue();
 
     // ─── Construction ────────────────────────────────────────────────────────────────────────────
 
@@ -273,6 +278,33 @@ contract Settlement is AccessControl, ReentrancyGuard {
         emit PoRSubmitted(stid);
 
         _finalizeSettled(stid);
+    }
+
+    /// @notice Permissionless trigger that escalates a transaction from `PoICommitted` to
+    ///         `EscalationL1` once TW1 has elapsed without a valid PoR.
+    /// @dev v0.11.2 §3 / §4 — TW1 expiry opens the claim window. The function is intentionally
+    ///      callable by anyone so liveness does not depend on a single party; whichever party has
+    ///      an interest in resolving the off-chain leg can drive progress. No escrow movement
+    ///      here — escrow stays locked until TW2 default-reverse or the DRP path.
+    function pokeTW1(bytes32 stid) external nonReentrant {
+        if (!_exists[stid]) revert TransactionNotFound();
+
+        Transaction storage txn = _txs[stid];
+        if (txn.state != State.PoICommitted) {
+            revert InvalidState(uint8(State.PoICommitted), uint8(txn.state));
+        }
+
+        // Validator-side timestamp manipulation is bounded to a few seconds on Base whereas TW1
+        // is on the minutes-to-hours scale; direct comparison is sound. Mirrors the suppression
+        // pattern used in submitPoR (PR #4).
+        // forge-lint: disable-next-line(incorrect-shift)
+        // forge-lint: disable-next-line(unsafe-typecast)
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp <= uint256(txn.committedAt) + uint256(txn.tw1)) revert EscalationNotDue();
+
+        State previous = txn.state;
+        txn.state = State.EscalationL1;
+        emit StateChanged(stid, previous, State.EscalationL1);
     }
 
     // ─── M2 stubs ────────────────────────────────────────────────────────────────────────────────
