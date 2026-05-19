@@ -6,7 +6,9 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {Settlement} from "../../src/Settlement.sol";
 import {State, Transaction, TimeWindows} from "../../src/types/Types.sol";
+import {IDRP} from "../../src/interfaces/IDRP.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
+import {MockDRP} from "../mocks/MockDRP.sol";
 import {SettlementHandler} from "./SettlementHandler.sol";
 
 /// @title SettlementInvariants — Part 1 invariant suite (M1)
@@ -16,11 +18,16 @@ contract SettlementInvariants is Test {
     Settlement settlement;
     SettlementHandler handler;
     MockERC20 usdc;
+    MockDRP drp;
 
     function setUp() public {
         usdc = new MockERC20("USD Coin", "USDC", 6);
+        drp = new MockDRP();
         settlement = new Settlement(
-            IERC20(address(usdc)), address(this), TimeWindows({tw1: 30 minutes, tw2: 12 hours, tw3: 48 hours})
+            IERC20(address(usdc)),
+            IDRP(address(drp)),
+            address(this),
+            TimeWindows({tw1: 30 minutes, tw2: 12 hours, tw3: 48 hours})
         );
         handler = new SettlementHandler(settlement, usdc);
 

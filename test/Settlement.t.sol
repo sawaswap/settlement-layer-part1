@@ -7,13 +7,18 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {Settlement} from "../src/Settlement.sol";
 import {State, Direction, Transaction, TimeWindows, PoIInput} from "../src/types/Types.sol";
+import {IDRP} from "../src/interfaces/IDRP.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
+import {MockDRP} from "./mocks/MockDRP.sol";
+import {MaliciousMockDRP} from "./mocks/MaliciousMockDRP.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title Settlement.t.sol — M1 unit and integration tests
 /// @notice Covers the eight §D.2.2 acceptance bullets plus a bonus check that all M2 stubs revert.
 contract SettlementTest is Test {
     Settlement settlement;
     MockERC20 usdc;
+    MockDRP drp;
 
     address admin = makeAddr("admin");
     address originator = makeAddr("originator");
@@ -30,8 +35,12 @@ contract SettlementTest is Test {
 
     function setUp() public {
         usdc = new MockERC20("USD Coin", "USDC", 6);
+        drp = new MockDRP();
         settlement = new Settlement(
-            IERC20(address(usdc)), admin, TimeWindows({tw1: DEFAULT_TW1, tw2: DEFAULT_TW2, tw3: DEFAULT_TW3})
+            IERC20(address(usdc)),
+            IDRP(address(drp)),
+            admin,
+            TimeWindows({tw1: DEFAULT_TW1, tw2: DEFAULT_TW2, tw3: DEFAULT_TW3})
         );
         // Default fixture: originator is funded and pre-approved for ten default commits' worth of
         // escrow. Tests that need to test the un-approved path (or insufficient balance) override.
@@ -42,6 +51,7 @@ contract SettlementTest is Test {
 
     function test_Deployment_SetsConstructorArgs() public view {
         assertEq(address(settlement.USDC()), address(usdc), "USDC address mismatch");
+        assertEq(address(settlement.DRP()), address(drp), "DRP address mismatch");
         assertTrue(settlement.hasRole(settlement.ADMIN_ROLE(), admin), "admin missing ADMIN_ROLE");
         assertTrue(settlement.hasRole(settlement.DEFAULT_ADMIN_ROLE(), admin), "admin missing DEFAULT_ADMIN_ROLE");
 
@@ -53,19 +63,39 @@ contract SettlementTest is Test {
 
     function test_Deployment_RevertsOnZeroUSDC() public {
         vm.expectRevert(Settlement.InvalidAddress.selector);
-        new Settlement(IERC20(address(0)), admin, TimeWindows({tw1: DEFAULT_TW1, tw2: DEFAULT_TW2, tw3: DEFAULT_TW3}));
+        new Settlement(
+            IERC20(address(0)),
+            IDRP(address(drp)),
+            admin,
+            TimeWindows({tw1: DEFAULT_TW1, tw2: DEFAULT_TW2, tw3: DEFAULT_TW3})
+        );
+    }
+
+    function test_Deployment_RevertsOnZeroDRP() public {
+        vm.expectRevert(Settlement.InvalidAddress.selector);
+        new Settlement(
+            IERC20(address(usdc)),
+            IDRP(address(0)),
+            admin,
+            TimeWindows({tw1: DEFAULT_TW1, tw2: DEFAULT_TW2, tw3: DEFAULT_TW3})
+        );
     }
 
     function test_Deployment_RevertsOnZeroAdmin() public {
         vm.expectRevert(Settlement.InvalidAddress.selector);
         new Settlement(
-            IERC20(address(usdc)), address(0), TimeWindows({tw1: DEFAULT_TW1, tw2: DEFAULT_TW2, tw3: DEFAULT_TW3})
+            IERC20(address(usdc)),
+            IDRP(address(drp)),
+            address(0),
+            TimeWindows({tw1: DEFAULT_TW1, tw2: DEFAULT_TW2, tw3: DEFAULT_TW3})
         );
     }
 
     function test_Deployment_RevertsOnZeroTimeWindow() public {
         vm.expectRevert(Settlement.InvalidTimeWindow.selector);
-        new Settlement(IERC20(address(usdc)), admin, TimeWindows({tw1: 0, tw2: DEFAULT_TW2, tw3: DEFAULT_TW3}));
+        new Settlement(
+            IERC20(address(usdc)), IDRP(address(drp)), admin, TimeWindows({tw1: 0, tw2: DEFAULT_TW2, tw3: DEFAULT_TW3})
+        );
     }
 
     // ─── 2. Configuration (Parameter Configuration Carve-Out, §C.3.7) ────────────────────────────
@@ -827,6 +857,311 @@ contract SettlementTest is Test {
         settlement.expireTW2(bytes32(uint256(0xdeadbeef)));
     }
 
+    // ─── 6.10 DRP boundary and TW3 default-reverse (M2 — §D.2.3 D8 "DRP frozen interface + mock harness" + D5 TW3) ─
+
+    /// @dev Happy path with DRP returning `Settled`. The claim was filed in TW2; `invokeDRP` drives
+    ///      `EscalationL1` → `EscalationL2_DRP`, calls the mock with the preset outcome, and
+    ///      atomically finalises to `Settled` with escrow released to the beneficiary.
+    function test_InvokeDRP_OutcomeSettled_ReleasesEscrowToBeneficiary() public {
+        bytes32 stid = _setUpInEscalationL1WithClaim();
+        drp.setOutcome(stid, IDRP.Outcome.Settled);
+
+        uint256 beneficiaryBefore = usdc.balanceOf(beneficiary);
+        uint256 contractBefore = usdc.balanceOf(address(settlement));
+
+        vm.expectEmit(true, true, true, true);
+        emit Settlement.StateChanged(stid, State.EscalationL1, State.EscalationL2_DRP);
+        vm.expectEmit(true, true, true, true);
+        emit Settlement.DRPInvoked(stid);
+        vm.expectEmit(true, true, true, true);
+        emit Settlement.StateChanged(stid, State.EscalationL2_DRP, State.Settled);
+        vm.expectEmit(true, true, true, true);
+        emit Settlement.Settled(stid, beneficiary, DEFAULT_AMOUNT);
+
+        vm.prank(claimant);
+        settlement.invokeDRP(stid);
+
+        Transaction memory txn = settlement.getTransaction(stid);
+        assertEq(uint8(txn.state), uint8(State.Settled), "state must reach Settled terminal");
+        assertTrue(txn.drpInvoked, "drpInvoked must be set");
+        assertTrue(txn.terminalMoved, "terminalMoved must be set on finalisation");
+        assertEq(usdc.balanceOf(beneficiary) - beneficiaryBefore, DEFAULT_AMOUNT, "beneficiary credited");
+        assertEq(contractBefore - usdc.balanceOf(address(settlement)), DEFAULT_AMOUNT, "escrow released");
+        assertTrue(drp.called(stid), "DRP marked as called");
+    }
+
+    /// @dev Mirror of the Settled-outcome path: DRP returns `Reversed`, escrow goes back to the
+    ///      originator via `_finalizeReversed`. Same CEI / event sequence, mirrored terminal side.
+    function test_InvokeDRP_OutcomeReversed_ReturnsEscrowToOriginator() public {
+        uint256 originatorBefore = usdc.balanceOf(originator);
+        bytes32 stid = _setUpInEscalationL1WithClaim();
+        drp.setOutcome(stid, IDRP.Outcome.Reversed);
+
+        vm.expectEmit(true, true, true, true);
+        emit Settlement.StateChanged(stid, State.EscalationL1, State.EscalationL2_DRP);
+        vm.expectEmit(true, true, true, true);
+        emit Settlement.DRPInvoked(stid);
+        vm.expectEmit(true, true, true, true);
+        emit Settlement.StateChanged(stid, State.EscalationL2_DRP, State.Reversed);
+        vm.expectEmit(true, true, true, true);
+        emit Settlement.Reversed(stid, originator, DEFAULT_AMOUNT);
+
+        vm.prank(claimant);
+        settlement.invokeDRP(stid);
+
+        Transaction memory txn = settlement.getTransaction(stid);
+        assertEq(uint8(txn.state), uint8(State.Reversed), "state must reach Reversed terminal");
+        assertTrue(txn.drpInvoked, "drpInvoked must be set");
+        assertTrue(txn.terminalMoved, "terminalMoved must be set on finalisation");
+        assertEq(usdc.balanceOf(originator), originatorBefore, "originator restored to pre-commit balance");
+    }
+
+    /// @dev Single-invocation guard. Even after a successful resolution, the state has moved past
+    ///      `EscalationL1` so the state guard fires first; `DRPAlreadyInvoked` is unreachable in
+    ///      practice but documented as a defence-in-depth secondary guard.
+    function test_InvokeDRP_RevertsOnSecondInvocation_FromTerminalState() public {
+        bytes32 stid = _setUpInEscalationL1WithClaim();
+        drp.setOutcome(stid, IDRP.Outcome.Settled);
+
+        vm.prank(claimant);
+        settlement.invokeDRP(stid);
+
+        vm.prank(claimant);
+        vm.expectRevert(
+            abi.encodeWithSelector(Settlement.InvalidState.selector, uint8(State.EscalationL1), uint8(State.Settled))
+        );
+        settlement.invokeDRP(stid);
+    }
+
+    /// @dev DRP boundary requires a claim on record; calling `invokeDRP` after `pokeTW1` but
+    ///      without `submitClaim` reverts `NoClaim`.
+    function test_InvokeDRP_RevertsWithoutClaim() public {
+        vm.prank(originator);
+        bytes32 stid = settlement.commitPoI(_defaultInput());
+        vm.warp(block.timestamp + DEFAULT_TW1 + 1);
+        vm.prank(stranger);
+        settlement.pokeTW1(stid);
+
+        vm.prank(claimant);
+        vm.expectRevert(Settlement.NoClaim.selector);
+        settlement.invokeDRP(stid);
+    }
+
+    /// @dev Eligibility guard: only the recorded `eligibleClaimant` can cross the DRP boundary.
+    function test_InvokeDRP_RevertsWhenCallerNotEligibleClaimant() public {
+        bytes32 stid = _setUpInEscalationL1WithClaim();
+        drp.setOutcome(stid, IDRP.Outcome.Settled);
+
+        vm.prank(stranger);
+        vm.expectRevert(Settlement.NotEligibleClaimant.selector);
+        settlement.invokeDRP(stid);
+    }
+
+    /// @dev State guard: `invokeDRP` requires state == `EscalationL1`. Calling on a fresh
+    ///      `PoICommitted` transaction reverts `InvalidState`.
+    function test_InvokeDRP_RevertsFromPoICommittedState() public {
+        vm.prank(originator);
+        bytes32 stid = settlement.commitPoI(_defaultInput());
+
+        vm.prank(claimant);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Settlement.InvalidState.selector, uint8(State.EscalationL1), uint8(State.PoICommitted)
+            )
+        );
+        settlement.invokeDRP(stid);
+    }
+
+    /// @dev Window guard: once TW1 + TW2 + TW3 has elapsed, the DRP path closes and the resolution
+    ///      route is `expireTW3` (default-reverse). `invokeDRP` reverts `WindowExpired`.
+    function test_InvokeDRP_RevertsAfterTW3Window() public {
+        bytes32 stid = _setUpInEscalationL1WithClaim();
+        drp.setOutcome(stid, IDRP.Outcome.Settled);
+
+        // Advance past the full TW1+TW2+TW3 envelope.
+        vm.warp(block.timestamp + DEFAULT_TW2 + DEFAULT_TW3 + 1);
+
+        vm.prank(claimant);
+        vm.expectRevert(Settlement.WindowExpired.selector);
+        settlement.invokeDRP(stid);
+    }
+
+    /// @dev Existence guard: unknown STID → `TransactionNotFound`. Mirrors the M1-era pattern.
+    function test_InvokeDRP_RevertsOnUnknownStid() public {
+        vm.prank(claimant);
+        vm.expectRevert(Settlement.TransactionNotFound.selector);
+        settlement.invokeDRP(bytes32(uint256(0xdeadbeef)));
+    }
+
+    /// @dev DRP revert propagates atomically. When the DRP is configured to revert, the entire
+    ///      `invokeDRP` call rolls back including the `EscalationL2_DRP` state transition and the
+    ///      `drpInvoked` flag, leaving the transaction at `EscalationL1` ready for another attempt
+    ///      (or eventual `expireTW3` after the window).
+    function test_InvokeDRP_RevertsWhenDRPReverts() public {
+        bytes32 stid = _setUpInEscalationL1WithClaim();
+        drp.setRevert(stid, true);
+
+        vm.prank(claimant);
+        vm.expectRevert(bytes("MockDRP: configured-revert"));
+        settlement.invokeDRP(stid);
+
+        Transaction memory txn = settlement.getTransaction(stid);
+        assertEq(uint8(txn.state), uint8(State.EscalationL1), "state stays EscalationL1 - DRP revert rolled back");
+        assertFalse(txn.drpInvoked, "drpInvoked stays false on DRP-revert rollback");
+    }
+
+    /// @dev TW3 default-reverse happy path. The MockDRP resolves synchronously, so the live
+    ///      scenario where `invokeDRP` transitions to `EscalationL2_DRP` but the DRP does not
+    ///      return within TW3 cannot be reached through the public surface alone. We construct
+    ///      the state directly via `vm.store` to exercise `expireTW3`'s own guards and finalisation
+    ///      path; the field-level state mutation pattern that lands transactions in
+    ///      `EscalationL2_DRP` is itself covered by the `OutcomeReversed` test above (same
+    ///      `_finalizeReversed` helper). The invariant suite in PR #8 will exercise this path
+    ///      through the handler's stateful sequencing.
+    function test_ExpireTW3_NoOutcome_DefaultReverses() public {
+        uint256 originatorBefore = usdc.balanceOf(originator);
+        bytes32 stid = _setUpInEscalationL1WithClaim();
+
+        // Manually transition the transaction to `EscalationL2_DRP` + `drpInvoked=true` via
+        // direct storage write. The Transaction struct packs `state` (offset 0) + `drpInvoked`
+        // (offset 1) + `terminalMoved` (offset 2) into one slot at struct-offset +7. The base
+        // slot for `_txs[stid]` is `keccak256(stid, slot-of-_txs)`. `_txs` is the fifth contract
+        // storage slot (after AccessControl `_roles`, ReentrancyGuard `_status`, `_defaultTW`,
+        // `_railPairTW1`) — slot index 4. The packed-slot value `0x0103` sets state=3
+        // (EscalationL2_DRP), drpInvoked=1, terminalMoved=0.
+        uint256 txsSlot = uint256(keccak256(abi.encode(stid, uint256(4))));
+        uint256 packedSlot = txsSlot + 7;
+        vm.store(address(settlement), bytes32(packedSlot), bytes32(uint256(0x0103)));
+
+        // Verify the manual injection placed the transaction in the expected state.
+        Transaction memory injected = settlement.getTransaction(stid);
+        assertEq(uint8(injected.state), uint8(State.EscalationL2_DRP), "state injected correctly");
+        assertTrue(injected.drpInvoked, "drpInvoked injected correctly");
+        assertFalse(injected.terminalMoved, "terminalMoved must remain false before expireTW3");
+
+        // Advance past TW1+TW2+TW3 absolute window.
+        vm.warp(block.timestamp + DEFAULT_TW2 + DEFAULT_TW3 + 1);
+
+        vm.expectEmit(true, true, true, true);
+        emit Settlement.StateChanged(stid, State.EscalationL2_DRP, State.Reversed);
+        vm.expectEmit(true, true, true, true);
+        emit Settlement.Reversed(stid, originator, DEFAULT_AMOUNT);
+
+        vm.prank(stranger);
+        settlement.expireTW3(stid);
+
+        Transaction memory txn = settlement.getTransaction(stid);
+        assertEq(uint8(txn.state), uint8(State.Reversed), "state must reach Reversed terminal");
+        assertTrue(txn.terminalMoved, "terminalMoved must be set on default-reverse finalisation");
+        assertEq(usdc.balanceOf(originator), originatorBefore, "originator restored to pre-commit balance");
+        assertEq(usdc.balanceOf(address(settlement)), 0, "no escrow remains in contract after default-reverse");
+    }
+
+    /// @dev Window guard on `expireTW3`. Before TW1+TW2+TW3 has elapsed, the default-reverse path
+    ///      is not yet eligible to fire and the poker reverts `EscalationNotDue`. Uses the same
+    ///      direct-storage state injection pattern as the happy-path test above.
+    function test_ExpireTW3_RevertsBeforeWindow() public {
+        bytes32 stid = _setUpInEscalationL1WithClaim();
+
+        // Inject EscalationL2_DRP state (see happy-path test for slot computation).
+        uint256 txsSlot = uint256(keccak256(abi.encode(stid, uint256(4))));
+        vm.store(address(settlement), bytes32(txsSlot + 7), bytes32(uint256(0x0103)));
+
+        // Past TW1 + TW2 but NOT past TW3.
+        vm.warp(block.timestamp + DEFAULT_TW2);
+
+        vm.prank(stranger);
+        vm.expectRevert(Settlement.EscalationNotDue.selector);
+        settlement.expireTW3(stid);
+    }
+
+    /// @dev State guard on `expireTW3` from `PoICommitted`. Reverts `InvalidState` before the
+    ///      window check.
+    function test_ExpireTW3_RevertsFromNonDRPState_PoICommitted() public {
+        vm.prank(originator);
+        bytes32 stid = settlement.commitPoI(_defaultInput());
+
+        // Past TW3 absolute envelope.
+        vm.warp(block.timestamp + DEFAULT_TW1 + DEFAULT_TW2 + DEFAULT_TW3 + 1);
+
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Settlement.InvalidState.selector, uint8(State.EscalationL2_DRP), uint8(State.PoICommitted)
+            )
+        );
+        settlement.expireTW3(stid);
+    }
+
+    /// @dev Symmetric state-guard test on `expireTW3` from `EscalationL1` (claim filed but DRP not
+    ///      invoked). The path forward in that case is `invokeDRP` or `expireTW2`, not `expireTW3`.
+    function test_ExpireTW3_RevertsFromEscalationL1State() public {
+        bytes32 stid = _setUpInEscalationL1WithClaim();
+
+        vm.warp(block.timestamp + DEFAULT_TW2 + DEFAULT_TW3 + 1);
+
+        vm.prank(stranger);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Settlement.InvalidState.selector, uint8(State.EscalationL2_DRP), uint8(State.EscalationL1)
+            )
+        );
+        settlement.expireTW3(stid);
+    }
+
+    /// @dev Existence guard: unknown STID → `TransactionNotFound`.
+    function test_ExpireTW3_RevertsOnUnknownStid() public {
+        vm.expectRevert(Settlement.TransactionNotFound.selector);
+        settlement.expireTW3(bytes32(uint256(0xdeadbeef)));
+    }
+
+    /// @dev Reentrancy boundary. Wires a malicious DRP that attempts to call back into
+    ///      `Settlement.invokeDRP` from within its own `resolve()`. The Settlement's
+    ///      `nonReentrant` modifier (OZ ReentrancyGuard v5) must block the re-entry; the
+    ///      attempted `resolve()` reverts with `ReentrancyGuardReentrantCall`, which in turn
+    ///      reverts the entire outer `invokeDRP` call (state mutation rolled back).
+    function test_InvokeDRP_NonReentrant_BlocksReentryViaMaliciousDRP() public {
+        MaliciousMockDRP maliciousDrp = new MaliciousMockDRP();
+        Settlement settlementMal = new Settlement(
+            IERC20(address(usdc)),
+            IDRP(address(maliciousDrp)),
+            admin,
+            TimeWindows({tw1: DEFAULT_TW1, tw2: DEFAULT_TW2, tw3: DEFAULT_TW3})
+        );
+        maliciousDrp.setSettlement(address(settlementMal));
+
+        // Drive the malicious-instance transaction into EscalationL1 with a claim. The default
+        // fixture's `_fundAndApprove` targets the canonical `settlement` instance; here we need
+        // an allowance against `settlementMal`, so inline the approval.
+        usdc.mint(originator, DEFAULT_AMOUNT);
+        vm.prank(originator);
+        usdc.approve(address(settlementMal), DEFAULT_AMOUNT);
+
+        vm.prank(originator);
+        bytes32 stid = settlementMal.commitPoI(_defaultInput());
+        vm.warp(block.timestamp + DEFAULT_TW1 + 1);
+        vm.prank(stranger);
+        settlementMal.pokeTW1(stid);
+        vm.prank(claimant);
+        settlementMal.submitClaim(stid, _defaultClaimData());
+
+        // invokeDRP triggers maliciousDrp.resolve, which tries to re-enter. The outer call
+        // reverts; OZ ReentrancyGuard v5 emits a `ReentrancyGuardReentrantCall` selector that
+        // propagates out through the malicious DRP's own `resolve` call.
+        vm.prank(claimant);
+        vm.expectRevert(ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+        settlementMal.invokeDRP(stid);
+
+        // State must remain at EscalationL1 (full revert rolled back the EscalationL2_DRP
+        // transition that occurred before the external call). The `reentryAttempted` flag on the
+        // malicious mock is also rolled back as part of the same revert frame, so we verify the
+        // reentrancy attempt indirectly through the specific `ReentrancyGuardReentrantCall`
+        // selector that `vm.expectRevert` matched above.
+        Transaction memory txn = settlementMal.getTransaction(stid);
+        assertEq(uint8(txn.state), uint8(State.EscalationL1), "state remains EscalationL1 - revert rolled back");
+        assertFalse(txn.drpInvoked, "drpInvoked stays false on reentrancy-blocked attempt");
+    }
+
     // ─── 7. Zero-amount revert ───────────────────────────────────────────────────────────────────
 
     function test_CommitPoI_RevertsOnZeroAmount() public {
@@ -889,15 +1224,12 @@ contract SettlementTest is Test {
     // ─── 9. Remaining M2 stubs revert ────────────────────────────────────────────────────────────
 
     function test_RemainingM2Stubs_RevertNotImplemented() public {
-        // `submitPoR` is implemented from PR #4 onward — covered by section 6.6.
-        // `submitClaim` / `updateClaim` / `expireTW2` are implemented from PR #6 onward — covered by 6.8.
-        // `invokeDRP` lands in PR #7. `settle` / `reverse` are retained as reverting stubs per the
-        // 15 May ratified decision to drop the external recovery-hatch track (unreachable under
-        // SafeERC20 atomic-revert semantics; kept only as ABI placeholders).
+        // `submitPoR` (PR #4), `submitClaim` / `updateClaim` / `expireTW2` (PR #6), and
+        // `invokeDRP` / `expireTW3` (PR #7) are all implemented and covered by their own sections.
+        // Only `settle` / `reverse` remain as reverting stubs per the 15 May ratified decision to
+        // drop the external recovery-hatch track (unreachable under SafeERC20 atomic-revert
+        // semantics; kept only as ABI placeholders).
         vm.startPrank(originator);
-
-        vm.expectRevert(Settlement.NotImplementedM1.selector);
-        settlement.invokeDRP(bytes32(0));
 
         vm.expectRevert(Settlement.NotImplementedM1.selector);
         settlement.settle(bytes32(0));
@@ -940,5 +1272,20 @@ contract SettlementTest is Test {
     ///      deferred to the off-chain pipeline / DRP layer.
     function _defaultClaimData() internal pure returns (bytes memory) {
         return bytes("claim-payload-v1");
+    }
+
+    /// @dev Drives the default fixture transaction through `commitPoI` + `pokeTW1` + `submitClaim`
+    ///      so it is positioned at `EscalationL1` with a claim on record. Returns the STID. Used
+    ///      by the DRP-boundary test suite (section 6.10) as the standard precondition.
+    function _setUpInEscalationL1WithClaim() internal returns (bytes32 stid) {
+        vm.prank(originator);
+        stid = settlement.commitPoI(_defaultInput());
+
+        vm.warp(block.timestamp + DEFAULT_TW1 + 1);
+        vm.prank(stranger);
+        settlement.pokeTW1(stid);
+
+        vm.prank(claimant);
+        settlement.submitClaim(stid, _defaultClaimData());
     }
 }
