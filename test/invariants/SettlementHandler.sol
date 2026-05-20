@@ -4,32 +4,66 @@ pragma solidity 0.8.24;
 import {Test} from "forge-std/Test.sol";
 
 import {Settlement} from "../../src/Settlement.sol";
-import {Direction, PoIInput, TimeWindows} from "../../src/types/Types.sol";
+import {State, Direction, Transaction, PoIInput, TimeWindows} from "../../src/types/Types.sol";
+import {IDRP} from "../../src/interfaces/IDRP.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
+import {MockDRP} from "../mocks/MockDRP.sol";
 
-/// @title SettlementHandler — bounded driver for the Settlement Layer invariant suite
-/// @notice The handler is the only contract the invariant fuzzer is permitted to call. It accepts
-///         random inputs from Foundry, bounds them into a meaningful range, mints + approves USDC
-///         for the random sender, calls `commitPoI`, and records the inputs so the invariants can
-///         compare stored state against expected state.
+/// @title SettlementHandler — bounded driver for the Settlement Layer invariant suite (M2)
+/// @notice The handler is the only contract the invariant fuzzer is permitted to call. Each
+///         `*_bounded` entry point accepts random inputs from Foundry, bounds them into a
+///         meaningful range, satisfies the relevant preconditions where practical (funding,
+///         approvals, caller identity, time advancement), and drives the corresponding Settlement
+///         Layer transition inside a try/catch so a reverted attempt is tolerated under
+///         `fail_on_revert = false`.
+/// @dev Every entry point increments an attempt counter and, on success, a success counter.
+///      Foundry reverts handler storage to the post-`setUp` snapshot between invariant runs, so
+///      these counters cannot be aggregated across a campaign; they are instead asserted by the
+///      deterministic `test_HandlerWiring_AllBoundedTransitionsCanSucceed` smoke test, which
+///      drives each entry point through a hand-picked success path. That test is the guard
+///      against the "handler always reverts" antipattern where the fuzzer registers a selector
+///      but every transition silently reverts and the invariants pass vacuously.
 contract SettlementHandler is Test {
     Settlement public immutable settlement;
     MockERC20 public immutable usdc;
+    MockDRP public immutable drp;
 
+    /// @dev Every STID returned by a successful `commitPoI`.
     bytes32[] public stids;
+
     mapping(bytes32 stid => uint256 amount) public expectedAmount;
     mapping(bytes32 stid => uint64 tw1) public expectedTW1;
     mapping(bytes32 stid => uint64 tw2) public expectedTW2;
     mapping(bytes32 stid => uint64 tw3) public expectedTW3;
+    mapping(bytes32 stid => address claimant) public eligibleClaimantOf;
+    mapping(bytes32 stid => address originator) public originatorOf;
 
-    uint256 public totalLocked;
+    // ─── Per-function attempt / success counters ─────────────────────────────────────────────────
+
     uint256 public commitAttempts;
     uint256 public commitSuccesses;
+    uint256 public porAttempts;
+    uint256 public porSuccesses;
+    uint256 public pokeTW1Attempts;
+    uint256 public pokeTW1Successes;
+    uint256 public claimAttempts;
+    uint256 public claimSuccesses;
+    uint256 public updateClaimAttempts;
+    uint256 public updateClaimSuccesses;
+    uint256 public expireTW2Attempts;
+    uint256 public expireTW2Successes;
+    uint256 public invokeDRPAttempts;
+    uint256 public invokeDRPSuccesses;
+    uint256 public expireTW3Attempts;
+    uint256 public expireTW3Successes;
 
-    constructor(Settlement settlement_, MockERC20 usdc_) {
+    constructor(Settlement settlement_, MockERC20 usdc_, MockDRP drp_) {
         settlement = settlement_;
         usdc = usdc_;
+        drp = drp_;
     }
+
+    // ─── commitPoI ───────────────────────────────────────────────────────────────────────────────
 
     function commitPoI_bounded(
         uint256 amount,
@@ -66,12 +100,130 @@ contract SettlementHandler is Test {
             expectedTW1[stid] = tw.tw1;
             expectedTW2[stid] = tw.tw2;
             expectedTW3[stid] = tw.tw3;
-            totalLocked += amount;
+            eligibleClaimantOf[stid] = claimant;
+            originatorOf[stid] = sender;
             commitSuccesses++;
         } catch {
             // tolerated under fail_on_revert = false
         }
     }
+
+    // ─── submitPoR ───────────────────────────────────────────────────────────────────────────────
+
+    function submitPoR_bounded(uint256 stidSeed, bytes calldata porData) external {
+        if (stids.length == 0) return;
+        porAttempts++;
+
+        bytes32 stid = _pickStid(stidSeed);
+        bytes memory data = porData.length == 0 ? bytes("por-fuzz") : porData;
+
+        vm.prank(eligibleClaimantOf[stid]);
+        try settlement.submitPoR(stid, data) {
+            porSuccesses++;
+        } catch {}
+    }
+
+    // ─── pokeTW1 ─────────────────────────────────────────────────────────────────────────────────
+
+    function pokeTW1_bounded(uint256 stidSeed, address caller) external {
+        if (stids.length == 0) return;
+        pokeTW1Attempts++;
+
+        bytes32 stid = _pickStid(stidSeed);
+        if (caller == address(0)) caller = address(0xF00D);
+
+        vm.prank(caller);
+        try settlement.pokeTW1(stid) {
+            pokeTW1Successes++;
+        } catch {}
+    }
+
+    // ─── submitClaim ─────────────────────────────────────────────────────────────────────────────
+
+    function submitClaim_bounded(uint256 stidSeed, bytes calldata claimData) external {
+        if (stids.length == 0) return;
+        claimAttempts++;
+
+        bytes32 stid = _pickStid(stidSeed);
+        bytes memory data = claimData.length == 0 ? bytes("claim-fuzz") : claimData;
+
+        vm.prank(eligibleClaimantOf[stid]);
+        try settlement.submitClaim(stid, data) {
+            claimSuccesses++;
+        } catch {}
+    }
+
+    // ─── updateClaim ─────────────────────────────────────────────────────────────────────────────
+
+    function updateClaim_bounded(uint256 stidSeed, bytes calldata claimData) external {
+        if (stids.length == 0) return;
+        updateClaimAttempts++;
+
+        bytes32 stid = _pickStid(stidSeed);
+        bytes memory data = claimData.length == 0 ? bytes("claim-fuzz-v2") : claimData;
+
+        vm.prank(eligibleClaimantOf[stid]);
+        try settlement.updateClaim(stid, data) {
+            updateClaimSuccesses++;
+        } catch {}
+    }
+
+    // ─── expireTW2 ───────────────────────────────────────────────────────────────────────────────
+
+    function expireTW2_bounded(uint256 stidSeed, address caller) external {
+        if (stids.length == 0) return;
+        expireTW2Attempts++;
+
+        bytes32 stid = _pickStid(stidSeed);
+        if (caller == address(0)) caller = address(0xF00D);
+
+        vm.prank(caller);
+        try settlement.expireTW2(stid) {
+            expireTW2Successes++;
+        } catch {}
+    }
+
+    // ─── invokeDRP ───────────────────────────────────────────────────────────────────────────────
+
+    function invokeDRP_bounded(uint256 stidSeed, uint8 outcomeSeed) external {
+        if (stids.length == 0) return;
+        invokeDRPAttempts++;
+
+        bytes32 stid = _pickStid(stidSeed);
+        IDRP.Outcome outcome = IDRP.Outcome(uint8(bound(uint256(outcomeSeed), 0, 1)));
+        drp.setOutcome(stid, outcome);
+
+        vm.prank(eligibleClaimantOf[stid]);
+        try settlement.invokeDRP(stid) {
+            invokeDRPSuccesses++;
+        } catch {}
+    }
+
+    // ─── expireTW3 ───────────────────────────────────────────────────────────────────────────────
+
+    function expireTW3_bounded(uint256 stidSeed, address caller) external {
+        if (stids.length == 0) return;
+        expireTW3Attempts++;
+
+        bytes32 stid = _pickStid(stidSeed);
+        if (caller == address(0)) caller = address(0xF00D);
+
+        vm.prank(caller);
+        try settlement.expireTW3(stid) {
+            expireTW3Successes++;
+        } catch {}
+    }
+
+    // ─── time advancement ────────────────────────────────────────────────────────────────────────
+
+    /// @dev Advances `block.timestamp` so that time-window-gated transitions become reachable for
+    ///      the fuzzer. Bounded to a wide range covering sub-TW1 nudges through full-TW3 expiry.
+    function warp_bounded(uint256 secs) external {
+        secs = bound(secs, 1, 100 hours);
+        vm.warp(block.timestamp + secs);
+    }
+
+    // ─── views ───────────────────────────────────────────────────────────────────────────────────
 
     function getStidCount() external view returns (uint256) {
         return stids.length;
@@ -79,5 +231,9 @@ contract SettlementHandler is Test {
 
     function getStidAt(uint256 i) external view returns (bytes32) {
         return stids[i];
+    }
+
+    function _pickStid(uint256 seed) internal view returns (bytes32) {
+        return stids[seed % stids.length];
     }
 }

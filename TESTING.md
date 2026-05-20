@@ -23,10 +23,10 @@ The repository runs three layers of validation:
 - **Foundry** is the primary framework, per Agreement §C.3.7.
 - **`forge test`** runs unit, integration, and invariant suites in a single invocation.
 - **`forge fmt --check`** enforces formatting; gating CI step.
-- **`forge coverage`** is used during M1 to check that all `Settlement.sol` external functions are
-  hit at least once. Coverage targets formalise in M2 (state-machine path coverage).
+- **`forge coverage`** checks that every `Settlement.sol` external function and state-machine
+  branch is exercised. Run as `forge coverage --report summary`.
 
-Foundry version is the latest stable release at the time of M1 delivery. CI installs via
+Foundry version is the latest stable release at the time of delivery. CI installs via
 `foundry-rs/foundry-toolchain@v1`. OpenZeppelin Contracts is pinned at v5.0.2 (commit
 `dbb6104ce834628e473d2173bbc9d47f81a9eec3`) via git submodule.
 
@@ -34,8 +34,10 @@ Foundry version is the latest stable release at the time of M1 delivery. CI inst
 
 - `solc_version = "0.8.24"` (no auto-detect drift).
 - `optimizer = true`, `optimizer_runs = 200`.
-- `[invariant] runs = 256, depth = 32, fail_on_revert = false`.
-- `[fuzz] runs = 256` for property-based unit tests in M2.
+- `[invariant] runs = 256, depth = 64, fail_on_revert = false` — `depth` was raised from 32 to 64
+  in M2 so the fuzzer can reach the deeper states of the widened transition surface
+  (commit → TW1 escalation → claim → DRP boundary → terminal) within a single run.
+- `[fuzz] runs = 256`.
 
 ## Determinism
 
@@ -66,99 +68,148 @@ The eight acceptance bullets in §D.2.2 each map to one or more named tests in
 | zero-amount revert conditions | `test_CommitPoI_RevertsOnZeroAmount`, `test_CommitPoI_RevertsOnZeroBeneficiary`, `test_CommitPoI_RevertsOnZeroClaimant` |
 | getter functions | `test_Getter_RevertsOnUnknownSTID`, `test_Getter_TransactionExistsReturnsTrue`, `test_Getter_NonceIncrementsPerOriginator` |
 
-Plus a bonus: `test_M2Stubs_RevertNotImplemented` confirms the six M2 protocol-action stubs revert
-with `NotImplementedM1`, preventing testnet integrators from accidentally believing they succeeded.
+Plus a bonus: `test_RemainingM2Stubs_RevertNotImplemented` confirms the remaining unimplemented
+external entries revert with `NotImplementedM1`. As M2 PRs land, implemented functions drop out of
+that test; by M2 close only `settle` / `reverse` remain (retained as reverting ABI placeholders
+per the 15 May ratified decision to drop the external recovery-hatch track).
+
+## M2 acceptance test mapping (§D.2.3)
+
+M2 implements §D.2.3 deliverables D4–D9. The unit/integration tests are organised into six
+categories in `test/Settlement.t.sol`, each a numbered section; the §D.2.3 floor of 24
+unit/integration tests is exceeded (70 at M2 close).
+
+| §D.2.3 area | Test section | Coverage |
+|---|---|---|
+| D4 — escrow lock + terminal escrow movement | 6.5 Escrow lock at PoI; 6.7 Finality | escrow pulled at `commitPoI`; escrow moves exactly once at terminal finality; terminal outcome is only `Settled` / `Reversed` |
+| D5 — TW1 / TW2 / TW3 timing | 6.8 TW1 expiry escalation; 6.9 TW2 default-reverse; 6.10 TW3 default-reverse | each window's expiry path: TW1 → `EscalationL1`; TW2 → default-reverse; TW3 → default-reverse |
+| D6 — PoR submission + verification gate | 6.6 PoR submission and Settled finality | valid PoR within TW1 → `Settled`; caller / state / window / payload guards |
+| D7 — claim submission + eligible-claimant predicate | 6.9 Claim submission and TW2 default-reverse | `submitClaim` / `updateClaim` against the eligible-claimant predicate; TW2-bound mutability |
+| D8 — DRP frozen interface stub + configurable mock harness | 6.10 DRP boundary and TW3 default-reverse | `invokeDRP` binary-outcome handling; `MockDRP` configurable harness; reentrancy boundary via `MaliciousMockDRP` |
+| D9 — unit tests for execution + escalation paths | sections 6.5–6.10 + invariant suite | 70 unit/integration tests + 7 invariant properties; all happy paths and the full revert-path surface of every external entry |
 
 ## Property catalogue
 
-The invariant suite asserts four properties. Each is exercised by Foundry over 256 runs of 32
-random handler calls each (8192 successful `commitPoI` calls per property under `fail_on_revert =
-false`).
+The invariant suite (`test/invariants/SettlementInvariants.t.sol`) asserts seven properties (P1–P7)
+over the full M2 transition surface. The handler (`test/invariants/SettlementHandler.sol`) registers
+every M2 entry point (`commitPoI`, `submitPoR`, `pokeTW1`, `submitClaim`, `updateClaim`,
+`expireTW2`, `invokeDRP`, `expireTW3`) plus a time-advancement action, so the fuzzer explores the
+whole state machine. Foundry runs 256 runs of 64 random handler calls each under
+`fail_on_revert = false`.
 
-### P1 — Terminal absorbing (M1: PoICommitted-only)
+Because Foundry reverts handler storage to the post-`setUp` snapshot between invariant runs, the
+per-function attempt/success counters cannot be aggregated across a campaign. The guard against the
+"handler always reverts" antipattern is therefore the deterministic
+`test_HandlerWiring_AllBoundedTransitionsCanSucceed` smoke test, which drives every handler entry
+point through a hand-picked success path and asserts its success counter increments. Campaign-wide
+call distribution is separately visible in Foundry's per-selector summary table.
 
-**Statement.** Once a transaction reaches a terminal state (`Settled` or `Reversed`), no subsequent
-handler call mutates that transaction's state. In M1 there are no transitions out of
-`PoICommitted`, so the strict M1 form of this property is: every committed transaction remains in
-state `PoICommitted` and `terminalMoved` and `drpInvoked` remain false.
+### P1 — Terminal absorbing
 
-**Why.** Locks down the M1 contract surface against accidental future mutation paths and freezes
-behaviour expected by §D.2.2's "state entry" acceptance bullet.
+**Statement.** The `terminalMoved` flag and a terminal state (`Settled` / `Reversed`) are set
+together, by the finalisation helpers and nothing else; no transition leaves a terminal state. The
+invariant asserts the biconditional `terminalMoved <=> (state is Settled or Reversed)`.
 
-**Handler surface.** `commitPoI_bounded`.
+**Why.** Catches both a terminal transaction re-leaving its state and `terminalMoved` being set
+without the matching terminal transition. Anchors §C.3.4 determinism and the §3 binary-finality
+guarantee.
 
-**M2 expansion.** When state-machine transitions land, P1 generalises to: `Settled` and `Reversed`
-are absorbing; once reached, the only legal subsequent calls are reads. Will require expanded
-handler surface (PoR submission, claim submission, settle, reverse, DRP invocation).
+**Handler surface.** Full M2 surface — terminal states are reached via `submitPoR`, `expireTW2`,
+`invokeDRP`, `expireTW3`.
 
 ### P2 — No transaction without commitPoI
 
-**Statement.** For every STID the handler has recorded as committed, the contract reports
-`transactionExists(stid) == true`, the stored `committedAt > 0`, and the stored `originator`,
-`beneficiary`, `eligibleClaimant` are all non-zero.
+**Statement.** For every recorded STID, `transactionExists(stid) == true`, `committedAt > 0`, and
+`originator` / `beneficiary` / `eligibleClaimant` are all non-zero.
 
-**Why.** Defends against any path that could create a "ghost" transaction (e.g., default-zero
-storage masquerading as a record). Anchors the existence sentinel.
+**Why.** Defends against any path that could create a "ghost" transaction. Anchors the existence
+sentinel.
 
-**Handler surface.** `commitPoI_bounded`.
+**Handler surface.** `commitPoI_bounded`; all M2 functions only operate on existing STIDs.
 
-**M2 expansion.** No structural change; all M2 functions only operate on existing STIDs.
+### P3 — Escrow conservation
 
-### P3 — Escrow amount immutability
+**Statement.** The Settlement contract's USDC balance equals the sum of `escrowAmount` over exactly
+the transactions that have NOT terminal-moved. Escrow is held from `commitPoI` until the terminal
+transition releases it; once `terminalMoved` flips true the transaction drops out of the active sum.
 
-**Statement.** For every committed STID, the stored `escrowAmount` equals the amount the handler
-passed to `commitPoI` (recorded in handler storage). The amount is positive.
+**Why.** The strong escrow-accounting guarantee: no escrow is lost, double-counted, or stranded.
+Anchors §3 escrow [1] and §C.2.
 
-**Why.** In M2 the escrow is locked via `safeTransferFrom`; the amount stored at PoI must be the
-authoritative reference for terminal payout. Any drift between input and storage is a defect.
-
-**Handler surface.** `commitPoI_bounded`; M2 will add post-commit handler calls but the
-*pre-terminal* invariant must remain.
-
-**M2 expansion.** Strengthen to: stored `escrowAmount` is invariant across all pre-terminal calls.
-After terminal finality (`Settled` / `Reversed`), the amount is the value transferred (matching
-the recorded amount minus optional protocol fee — fee scope is in M2 only if the spec lands it).
+**Handler surface.** Full M2 surface — the balance changes on `commitPoI` (in) and on every
+terminal transition (out).
 
 ### P4 — Time windows locked at PoI
 
-**Statement.** For every committed STID, the stored `tw1`, `tw2`, `tw3` equal the default time
-windows that were active at the moment of commit. Even if the admin subsequently calls
-`setDefaultTimeWindows`, the transaction's stored windows do not change.
+**Statement.** For every committed STID, the stored `tw1` / `tw2` / `tw3` equal the defaults active
+at the moment of commit, regardless of subsequent admin `setDefaultTimeWindows` calls.
 
-**Why.** Per §C.3.3, "all selected durations must be locked per transaction at PoI commitment".
-This is the protocol's strong guarantee that an in-flight transaction does not have its timing
-contract mutated by configuration drift.
+**Why.** Per §C.3.3, "all selected durations must be locked per transaction at PoI commitment" —
+the protocol's guarantee that an in-flight transaction's timing contract is not mutated by
+configuration drift.
 
-**Handler surface.** Currently `commitPoI_bounded`. Could optionally extend to a handler that also
-calls `setDefaultTimeWindows_bounded` (granted the admin role) so we observe the property under
-post-commit defaults churn; deferred to M2 alongside the rail-pair profile resolution work.
+**Handler surface.** `commitPoI_bounded`.
 
-**M2 expansion.** Same statement, exercised through a richer handler that mutates defaults
-mid-sequence and across the directional rail-pair profile lookup.
+### P5 — Single-move (escrow amount immutability)
+
+**Statement.** The escrow amount recorded at `commitPoI` never changes for the life of the
+transaction.
+
+**Why.** Combined with P1 (`terminalMoved` tracks the terminal transition) and P3 (terminal escrow
+is excluded from the contract balance), this gives the single-move invariant: escrow leaves the
+contract exactly once, at the terminal transition, in precisely the committed amount. Anchors
+§C.3.4 and the §3 single-move guarantee.
+
+**Handler surface.** Full M2 surface — asserted across all pre- and post-terminal states.
+
+### P6 — DRP single-invocation consistency
+
+**Statement.** `drpInvoked == true` implies the state is `EscalationL2_DRP`, `Settled`, or
+`Reversed` — never `PoICommitted` or `EscalationL1`. `drpInvoked` is set only as part of the
+`invokeDRP` transition.
+
+**Why.** The DRP boundary is crossed at most once per STID (addendum §2 / v0.11.2 §9). A second
+`invokeDRP` is blocked by the state guard and the `DRPAlreadyInvoked` guard; this invariant
+confirms `drpInvoked` is never set spuriously outside the DRP transition.
+
+**Handler surface.** `invokeDRP_bounded` sets `drpInvoked`; the invariant holds across the full
+surface.
+
+### P7 — Eligible-claimant immutability
+
+**Statement.** The `eligibleClaimant` recorded at `commitPoI` never changes.
+
+**Why.** The claimant predicate gates `submitPoR` / `submitClaim` / `updateClaim` / `invokeDRP`; a
+mutable claimant would silently widen the authorised-caller set. Anchors §C.2 and §5–§7.
+
+**Handler surface.** Full M2 surface.
 
 ## Coverage targets
 
-**M1 (this milestone)** — every external function in `Settlement.sol` is hit at least once by
-unit/integration tests. Verified via `forge coverage` ad hoc.
+**M1** — every external function in `Settlement.sol` hit at least once by unit/integration tests.
 
-**M2 (forward)** — full state-machine path coverage:
+**M2 (this milestone)** — full state-machine path coverage, achieved:
 
-- TW1 expiry → escalation L1 (PoR not received).
-- PoR valid → Settled.
-- Claim within TW2 → escalation L2 / DRP.
-- DRP returns Settled / Reversed.
-- All six terminal paths in §C.3.1 + the binary finality outcomes in §3.
+- TW1 expiry → `EscalationL1` (PoR not received) — section 6.8.
+- Valid PoR within TW1 → `Settled` — section 6.6.
+- Claim within TW2 → `EscalationL1` claim lifecycle — section 6.9.
+- TW2 expiry without claim → default-reverse → `Reversed` — section 6.9.
+- DRP invocation → `EscalationL2_DRP` → `Settled` / `Reversed` on binary outcome — section 6.10.
+- TW3 expiry without DRP outcome → default-reverse → `Reversed` — section 6.10.
+- Terminal outcomes restricted to `Settled` / `Reversed`; escrow moves exactly once — section 6.7.
 
-Plus mandatory M2 invariant additions:
+M2 invariant additions, all landed (P3 / P5 / P6 in the catalogue above):
 
-- Escrow conservation: `USDC.balanceOf(Settlement)` equals the sum of unsettled `escrowAmount`
-  values across all in-flight transactions.
-- Single-move escrow: `terminalMoved` flips exactly once and only at terminal finality.
-- DRP single-invocation: `drpInvoked` flips at most once; the second `invokeDRP` reverts.
+- P3 escrow conservation: `USDC.balanceOf(Settlement)` equals the sum of non-terminal
+  `escrowAmount` values.
+- P5 single-move escrow: escrow leaves the contract exactly once, at terminal finality, in the
+  committed amount.
+- P6 DRP single-invocation: `drpInvoked` is set only within the `invokeDRP` transition; a second
+  `invokeDRP` reverts.
 
-**M3** — at least six post-deployment verification checks on Base Sepolia, including:
+**M3 (forward)** — at least six post-deployment verification checks on Base Sepolia, including:
 
-- Independent third-party clean-clone reproducibility (`D.3.3` acceptance check).
+- Independent third-party clean-clone reproducibility (§D.3.3 acceptance check).
 - Round-trip a `commitPoI` call against the deployed contract.
 - Storage and event verification via `cast`.
 - Gas report for all Part 1 protocol actions.
