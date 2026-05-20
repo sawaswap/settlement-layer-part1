@@ -8,6 +8,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import {State, Direction, Transaction, TimeWindows, PoIInput} from "./types/Types.sol";
 import {STID} from "./libraries/STID.sol";
+import {IDRP} from "./interfaces/IDRP.sol";
 
 /// @title Settlement — SawaSwap Settlement Layer (Part 1)
 /// @notice Implements the Part 1 state machine of the SawaSwap protocol (Core Protocol v0.11.2):
@@ -15,12 +16,13 @@ import {STID} from "./libraries/STID.sol";
 /// @dev M1 delivered the on-chain skeleton: state enum, transaction storage, `commitPoI`, getters,
 ///      and admin-restricted time-window configuration. M2 progressively replaces the M2 stubs:
 ///      PR #3 added escrow lock on `commitPoI`; PR #4 added `submitPoR` and the Settled finality
-///      path; PR #5 added TW1 expiry escalation via `pokeTW1`; PR #6 adds claim handling
-///      (`submitClaim` / `updateClaim`) and TW2 default-reverse via `expireTW2`; PR #7 will add
-///      the DRP boundary and TW3 expiry. The external `settle` / `reverse` recovery hatches are
-///      retained as M1 stubs reverting `NotImplementedM1()` per the 15 May ratified decision
-///      to drop them as unreachable under SafeERC20 atomic-revert semantics. Production deployment
-///      guards (Section E of the Agreement) are gated to a separate phase beyond Part 1.
+///      path; PR #5 added TW1 expiry escalation via `pokeTW1`; PR #6 added claim handling
+///      (`submitClaim` / `updateClaim`) and TW2 default-reverse via `expireTW2`; PR #7 adds the
+///      DRP boundary (`invokeDRP`) and TW3 default-reverse (`expireTW3`). The external `settle` /
+///      `reverse` recovery hatches are retained as M1 stubs reverting `NotImplementedM1()` per the
+///      15 May ratified decision to drop them as unreachable under SafeERC20 atomic-revert
+///      semantics. Production deployment guards (Section E of the Agreement) are gated to a
+///      separate phase beyond Part 1.
 contract Settlement is AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -30,6 +32,13 @@ contract Settlement is AccessControl, ReentrancyGuard {
 
     /// @notice ERC-20 token used as the escrow asset (USDC on the deployment chain).
     IERC20 public immutable USDC;
+
+    /// @notice Frozen DRP boundary contract (v0.11.2 §9, addendum §2). The Settlement Layer is the
+    ///         sole permitted caller of `DRP.resolve(stid)`; the DRP itself is out of Part-1 scope
+    ///         and is wired in via a mock harness for M2 testing.
+    /// @dev Immutable from construction. The mock is parameterised at deploy time; the production
+    ///      address is supplied when the canonical instance deploys in M3.
+    IDRP public immutable DRP;
 
     /// @dev Default time-window configuration; overridable per rail-pair via {setRailPairProfile}.
     TimeWindows private _defaultTW;
@@ -152,20 +161,37 @@ contract Settlement is AccessControl, ReentrancyGuard {
     ///         is the DRP boundary (`invokeDRP`, PR #7), not the default-reverse poker.
     error ClaimPending();
 
+    /// @notice Thrown when `invokeDRP` is called on a transaction that has no claim on record.
+    /// @dev `submitClaim` must be called first; without a claim the DRP has nothing to resolve.
+    error NoClaim();
+
+    /// @notice Thrown when `invokeDRP` is called on a transaction whose DRP boundary has already
+    ///         been crossed. Enforces the single-invocation invariant per addendum §2 / v0.11.2 §9.
+    error DRPAlreadyInvoked();
+
     // ─── Construction ────────────────────────────────────────────────────────────────────────────
 
     /// @param usdc                 ERC-20 token contract used for escrow (USDC on the target chain).
+    /// @param drp                  Frozen DRP boundary contract per v0.11.2 §9 (addendum §2). M2
+    ///                             wires the configurable `MockDRP` harness; M3 / production
+    ///                             deployments supply the canonical DRP address.
     /// @param admin                Address that holds the protocol's `ADMIN_ROLE` and `DEFAULT_ADMIN_ROLE`.
     ///                             On production deployments this is the Client's Safe multisig.
     /// @param defaultTimeWindows   Initial default TW1 / TW2 / TW3 (in seconds). All non-zero.
-    constructor(IERC20 usdc, address admin, TimeWindows memory defaultTimeWindows) {
+    /// @dev Constructor signature is intentionally widened in PR #7 to accept the DRP address.
+    ///      The M1 demo deployment (Base Sepolia, 2026-05-11) was an ad-hoc smoke test and is not
+    ///      considered the canonical instance; the M3 deploy under the contract's Section E path
+    ///      uses this widened signature directly.
+    constructor(IERC20 usdc, IDRP drp, address admin, TimeWindows memory defaultTimeWindows) {
         if (address(usdc) == address(0)) revert InvalidAddress();
+        if (address(drp) == address(0)) revert InvalidAddress();
         if (admin == address(0)) revert InvalidAddress();
         if (defaultTimeWindows.tw1 == 0 || defaultTimeWindows.tw2 == 0 || defaultTimeWindows.tw3 == 0) {
             revert InvalidTimeWindow();
         }
 
         USDC = usdc;
+        DRP = drp;
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(ADMIN_ROLE, admin);
         _defaultTW = defaultTimeWindows;
@@ -445,12 +471,82 @@ contract Settlement is AccessControl, ReentrancyGuard {
         _finalizeReversed(stid);
     }
 
-    // ─── M2 stubs ────────────────────────────────────────────────────────────────────────────────
+    /// @notice Cross the DRP boundary for a transaction that has reached `EscalationL1` with a
+    ///         claim on record. Drives the state to `EscalationL2_DRP`, calls the frozen DRP
+    ///         interface for a binary outcome, and atomically finalises to the resolved terminal
+    ///         state (`Settled` or `Reversed`) within the TW3 window.
+    /// @dev v0.11.2 §9 + addendum §2 — the Settlement Layer is the sole permitted caller of
+    ///      `DRP.resolve(stid)` and the DRP returns a binary outcome. The single-invocation
+    ///      invariant is enforced by `drpInvoked`; the time window is the full
+    ///      `committedAt + tw1 + tw2 + tw3` envelope (after which `expireTW3` takes over via the
+    ///      default-reverse path). Strict Checks-Effects-Interactions: state mutates to
+    ///      `EscalationL2_DRP` and `drpInvoked = true` is set BEFORE the external `DRP.resolve`
+    ///      call; the subsequent `_finalizeSettled` / `_finalizeReversed` is itself CEI-strict and
+    ///      reentrancy-guarded by the outer `nonReentrant` modifier.
+    /// @param stid Transaction identifier returned by `commitPoI`.
+    function invokeDRP(bytes32 stid) external nonReentrant {
+        if (!_exists[stid]) revert TransactionNotFound();
 
-    /// @notice [M2] Invoke the Dispute Resolution Protocol. Reverts in M1.
-    function invokeDRP(bytes32) external pure {
-        revert NotImplementedM1();
+        Transaction storage txn = _txs[stid];
+        if (txn.state != State.EscalationL1) {
+            revert InvalidState(uint8(State.EscalationL1), uint8(txn.state));
+        }
+        if (msg.sender != txn.eligibleClaimant) revert NotEligibleClaimant();
+        if (_claimHash[stid] == bytes32(0)) revert NoClaim();
+        if (txn.drpInvoked) revert DRPAlreadyInvoked();
+        uint256 absoluteExpiry = uint256(txn.committedAt) + uint256(txn.tw1) + uint256(txn.tw2) + uint256(txn.tw3);
+        // forge-lint: disable-next-line(incorrect-shift)
+        // forge-lint: disable-next-line(unsafe-typecast)
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp > absoluteExpiry) revert WindowExpired();
+
+        // Effects: transition state + set drpInvoked BEFORE the external DRP call.
+        State previous = txn.state;
+        txn.state = State.EscalationL2_DRP;
+        txn.drpInvoked = true;
+        emit StateChanged(stid, previous, State.EscalationL2_DRP);
+        emit DRPInvoked(stid);
+
+        // Interaction: the single DRP boundary call. `nonReentrant` blocks any callback-driven
+        // re-entry into Settlement; the DRP contract is constrained by the addendum to a single
+        // invocation per STID, which the mock enforces locally as well.
+        IDRP.Outcome outcome = DRP.resolve(stid);
+
+        // Atomic finalisation. The helpers' `AlreadyFinalized` guard provides defence-in-depth
+        // against any re-entry that somehow bypasses `nonReentrant`.
+        if (outcome == IDRP.Outcome.Settled) {
+            _finalizeSettled(stid);
+        } else {
+            _finalizeReversed(stid);
+        }
     }
+
+    /// @notice Permissionless default-reverse poker for the TW3 expiry path: invoked when the DRP
+    ///         was called but did not produce an outcome within TW3, the transaction default-
+    ///         reverses and escrow returns to the originator.
+    /// @dev v0.11.2 §3 / §9 — confirmed by Francis on 2026-05-14 with his own rationale on
+    ///      permissionless liveness preservation ("permissionless liveness preserved; no
+    ///      centralized rescue operation"), re-confirmed 2026-05-15 as bullet (1) of his
+    ///      three-point alignment ratification. Reaching this poker requires `invokeDRP` to have
+    ///      fired (state = `EscalationL2_DRP`); if no claim was filed at all the path is
+    ///      `expireTW2`, not this one.
+    function expireTW3(bytes32 stid) external nonReentrant {
+        if (!_exists[stid]) revert TransactionNotFound();
+
+        Transaction storage txn = _txs[stid];
+        if (txn.state != State.EscalationL2_DRP) {
+            revert InvalidState(uint8(State.EscalationL2_DRP), uint8(txn.state));
+        }
+        uint256 absoluteExpiry = uint256(txn.committedAt) + uint256(txn.tw1) + uint256(txn.tw2) + uint256(txn.tw3);
+        // forge-lint: disable-next-line(incorrect-shift)
+        // forge-lint: disable-next-line(unsafe-typecast)
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp <= absoluteExpiry) revert EscalationNotDue();
+
+        _finalizeReversed(stid);
+    }
+
+    // ─── M2 stubs ────────────────────────────────────────────────────────────────────────────────
 
     /// @notice [M2] Retained as a reverting stub per the 15 May ratified decision to drop the
     ///         external recovery-hatch track. Always reverts `NotImplementedM1`.
