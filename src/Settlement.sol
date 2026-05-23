@@ -521,22 +521,32 @@ contract Settlement is AccessControl, ReentrancyGuard {
         }
     }
 
-    /// @notice Permissionless default-reverse poker for the TW3 expiry path: invoked when the DRP
-    ///         was called but did not produce an outcome within TW3, the transaction default-
-    ///         reverses and escrow returns to the originator.
+    /// @notice Permissionless default-reverse poker for the TW3 expiry path: a claimed transaction
+    ///         whose dispute was not resolved through the DRP within the full
+    ///         `committedAt + tw1 + tw2 + tw3` window default-reverses, returning escrow to the
+    ///         originator.
     /// @dev v0.11.2 §3 / §9 — confirmed by Francis on 2026-05-14 with his own rationale on
     ///      permissionless liveness preservation ("permissionless liveness preserved; no
-    ///      centralized rescue operation"), re-confirmed 2026-05-15 as bullet (1) of his
-    ///      three-point alignment ratification. Reaching this poker requires `invokeDRP` to have
-    ///      fired (state = `EscalationL2_DRP`); if no claim was filed at all the path is
-    ///      `expireTW2`, not this one.
+    ///      centralized rescue operation"), re-confirmed 2026-05-15.
+    /// @dev Guarded on `EscalationL1`, not `EscalationL2_DRP`. `invokeDRP` is atomic — it
+    ///      transitions to `EscalationL2_DRP`, calls `DRP.resolve`, and finalises in a single
+    ///      transaction — so `EscalationL2_DRP` is never a persisted resting state and a guard on
+    ///      it would be unreachable. A claimed transaction rests in `EscalationL1` until either
+    ///      `invokeDRP` resolves it within the window or this poker default-reverses it after the
+    ///      window. The `EscalationL1` escalation surface partitions cleanly by claim status:
+    ///      no claim past TW2 → `expireTW2`; claim past the full window → `expireTW3`; claim still
+    ///      inside the window → `invokeDRP`. The two pokers are mutually exclusive — `expireTW2`
+    ///      requires no claim, `expireTW3` requires a claim. No lazy `_expireTW1IfDue` here: a
+    ///      claim can only be filed via `submitClaim`, which itself requires `EscalationL1`, so a
+    ///      claimed transaction is always already escalated.
     function expireTW3(bytes32 stid) external nonReentrant {
         if (!_exists[stid]) revert TransactionNotFound();
 
         Transaction storage txn = _txs[stid];
-        if (txn.state != State.EscalationL2_DRP) {
-            revert InvalidState(uint8(State.EscalationL2_DRP), uint8(txn.state));
+        if (txn.state != State.EscalationL1) {
+            revert InvalidState(uint8(State.EscalationL1), uint8(txn.state));
         }
+        if (_claimHash[stid] == bytes32(0)) revert NoClaim();
         uint256 absoluteExpiry = uint256(txn.committedAt) + uint256(txn.tw1) + uint256(txn.tw2) + uint256(txn.tw3);
         // forge-lint: disable-next-line(incorrect-shift)
         // forge-lint: disable-next-line(unsafe-typecast)

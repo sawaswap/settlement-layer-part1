@@ -1010,40 +1010,21 @@ contract SettlementTest is Test {
         assertFalse(txn.drpInvoked, "drpInvoked stays false on DRP-revert rollback");
     }
 
-    /// @dev TW3 default-reverse happy path. The MockDRP resolves synchronously, so the live
-    ///      scenario where `invokeDRP` transitions to `EscalationL2_DRP` but the DRP does not
-    ///      return within TW3 cannot be reached through the public surface alone. We construct
-    ///      the state directly via `vm.store` to exercise `expireTW3`'s own guards and finalisation
-    ///      path; the field-level state mutation pattern that lands transactions in
-    ///      `EscalationL2_DRP` is itself covered by the `OutcomeReversed` test above (same
-    ///      `_finalizeReversed` helper). The invariant suite in PR #8 will exercise this path
-    ///      through the handler's stateful sequencing.
-    function test_ExpireTW3_NoOutcome_DefaultReverses() public {
+    /// @dev TW3 default-reverse happy path, exercised entirely through the public surface. A
+    ///      claimed transaction whose dispute is not resolved through `invokeDRP` within the full
+    ///      TW1 + TW2 + TW3 window is default-reversed by a permissionless `expireTW3` call:
+    ///      escrow returns to the originator, state reaches `Reversed`. No `vm.store` — after the
+    ///      22 May re-guard `expireTW3` fires from `EscalationL1`, the state a claimed transaction
+    ///      actually rests in (`invokeDRP` is atomic, so `EscalationL2_DRP` never persists).
+    function test_ExpireTW3_ClaimUnresolved_DefaultReverses() public {
         uint256 originatorBefore = usdc.balanceOf(originator);
         bytes32 stid = _setUpInEscalationL1WithClaim();
 
-        // Manually transition the transaction to `EscalationL2_DRP` + `drpInvoked=true` via
-        // direct storage write. The Transaction struct packs `state` (offset 0) + `drpInvoked`
-        // (offset 1) + `terminalMoved` (offset 2) into one slot at struct-offset +7. The base
-        // slot for `_txs[stid]` is `keccak256(stid, slot-of-_txs)`. `_txs` is the fifth contract
-        // storage slot (after AccessControl `_roles`, ReentrancyGuard `_status`, `_defaultTW`,
-        // `_railPairTW1`) — slot index 4. The packed-slot value `0x0103` sets state=3
-        // (EscalationL2_DRP), drpInvoked=1, terminalMoved=0.
-        uint256 txsSlot = uint256(keccak256(abi.encode(stid, uint256(4))));
-        uint256 packedSlot = txsSlot + 7;
-        vm.store(address(settlement), bytes32(packedSlot), bytes32(uint256(0x0103)));
-
-        // Verify the manual injection placed the transaction in the expected state.
-        Transaction memory injected = settlement.getTransaction(stid);
-        assertEq(uint8(injected.state), uint8(State.EscalationL2_DRP), "state injected correctly");
-        assertTrue(injected.drpInvoked, "drpInvoked injected correctly");
-        assertFalse(injected.terminalMoved, "terminalMoved must remain false before expireTW3");
-
-        // Advance past TW1+TW2+TW3 absolute window.
+        // Advance past the full TW1 + TW2 + TW3 window without invoking the DRP.
         vm.warp(block.timestamp + DEFAULT_TW2 + DEFAULT_TW3 + 1);
 
         vm.expectEmit(true, true, true, true);
-        emit Settlement.StateChanged(stid, State.EscalationL2_DRP, State.Reversed);
+        emit Settlement.StateChanged(stid, State.EscalationL1, State.Reversed);
         vm.expectEmit(true, true, true, true);
         emit Settlement.Reversed(stid, originator, DEFAULT_AMOUNT);
 
@@ -1057,17 +1038,12 @@ contract SettlementTest is Test {
         assertEq(usdc.balanceOf(address(settlement)), 0, "no escrow remains in contract after default-reverse");
     }
 
-    /// @dev Window guard on `expireTW3`. Before TW1+TW2+TW3 has elapsed, the default-reverse path
-    ///      is not yet eligible to fire and the poker reverts `EscalationNotDue`. Uses the same
-    ///      direct-storage state injection pattern as the happy-path test above.
+    /// @dev Window guard on `expireTW3`. Before the full TW1 + TW2 + TW3 window has elapsed, the
+    ///      default-reverse path is not yet eligible and the poker reverts `EscalationNotDue`.
     function test_ExpireTW3_RevertsBeforeWindow() public {
         bytes32 stid = _setUpInEscalationL1WithClaim();
 
-        // Inject EscalationL2_DRP state (see happy-path test for slot computation).
-        uint256 txsSlot = uint256(keccak256(abi.encode(stid, uint256(4))));
-        vm.store(address(settlement), bytes32(txsSlot + 7), bytes32(uint256(0x0103)));
-
-        // Past TW1 + TW2 but NOT past TW3.
+        // The helper already warped past TW1; advance into TW2 but not past TW1 + TW2 + TW3.
         vm.warp(block.timestamp + DEFAULT_TW2);
 
         vm.prank(stranger);
@@ -1075,35 +1051,41 @@ contract SettlementTest is Test {
         settlement.expireTW3(stid);
     }
 
-    /// @dev State guard on `expireTW3` from `PoICommitted`. Reverts `InvalidState` before the
-    ///      window check.
-    function test_ExpireTW3_RevertsFromNonDRPState_PoICommitted() public {
+    /// @dev Claim-presence guard on `expireTW3`. An `EscalationL1` transaction with no claim on
+    ///      record default-reverses through `expireTW2`, not `expireTW3` — `expireTW3` reverts
+    ///      `NoClaim`. This is the claim-status partition: `expireTW2` requires no claim,
+    ///      `expireTW3` requires a claim, so the two pokers are mutually exclusive.
+    function test_ExpireTW3_RevertsWhenNoClaim() public {
         vm.prank(originator);
         bytes32 stid = settlement.commitPoI(_defaultInput());
 
-        // Past TW3 absolute envelope.
+        // Escalate to EscalationL1 via pokeTW1 without filing a claim.
+        vm.warp(block.timestamp + DEFAULT_TW1 + 1);
+        vm.prank(stranger);
+        settlement.pokeTW1(stid);
+
+        // Advance past the full window; the transaction still has no claim.
+        vm.warp(block.timestamp + DEFAULT_TW2 + DEFAULT_TW3);
+
+        vm.prank(stranger);
+        vm.expectRevert(Settlement.NoClaim.selector);
+        settlement.expireTW3(stid);
+    }
+
+    /// @dev State guard on `expireTW3`. A transaction still in `PoICommitted` (never escalated)
+    ///      reverts `InvalidState` — there is no lazy escalate on `expireTW3`, because a claimed
+    ///      transaction is always already in `EscalationL1` (a claim can only be filed via
+    ///      `submitClaim`, which itself requires `EscalationL1`).
+    function test_ExpireTW3_RevertsFromPoICommitted() public {
+        vm.prank(originator);
+        bytes32 stid = settlement.commitPoI(_defaultInput());
+
         vm.warp(block.timestamp + DEFAULT_TW1 + DEFAULT_TW2 + DEFAULT_TW3 + 1);
 
         vm.prank(stranger);
         vm.expectRevert(
             abi.encodeWithSelector(
-                Settlement.InvalidState.selector, uint8(State.EscalationL2_DRP), uint8(State.PoICommitted)
-            )
-        );
-        settlement.expireTW3(stid);
-    }
-
-    /// @dev Symmetric state-guard test on `expireTW3` from `EscalationL1` (claim filed but DRP not
-    ///      invoked). The path forward in that case is `invokeDRP` or `expireTW2`, not `expireTW3`.
-    function test_ExpireTW3_RevertsFromEscalationL1State() public {
-        bytes32 stid = _setUpInEscalationL1WithClaim();
-
-        vm.warp(block.timestamp + DEFAULT_TW2 + DEFAULT_TW3 + 1);
-
-        vm.prank(stranger);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                Settlement.InvalidState.selector, uint8(State.EscalationL2_DRP), uint8(State.EscalationL1)
+                Settlement.InvalidState.selector, uint8(State.EscalationL1), uint8(State.PoICommitted)
             )
         );
         settlement.expireTW3(stid);
