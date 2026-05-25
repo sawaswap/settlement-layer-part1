@@ -25,7 +25,7 @@ number_underscore = "thousands"
 
 [invariant]
 runs = 256
-depth = 32
+depth = 64
 fail_on_revert = false
 call_override = false
 dictionary_weight = 80
