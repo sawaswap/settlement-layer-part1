@@ -28,9 +28,9 @@ Part 2.
 
 | Milestone | Status | Notes |
 |----------:|:------:|-------|
-| **M1 — Environment + Contract Skeleton (30%)** | this branch | state enum, transaction storage, `commitPoI`, getters, admin TW config, M2 stubs |
-| **M2 — Settlement Layer State Machine (50%)** | pending | escrow lock, TW expiry transitions, PoR / Claim / DRP, terminal finality |
-| **M3 — Testnet Deployment + Handover (20%)** | pending | Base Sepolia deploy, gas report, handover docs |
+| **M1 — Environment + Contract Skeleton (30%)** | accepted 2026-05-11 | state enum, transaction storage, `commitPoI`, getters, admin TW config, M2 stubs; tag `v0.1.0-m1` |
+| **M2 — Settlement Layer State Machine (50%)** | accepted 2026-05-24 | escrow lock, TW expiry transitions, PoR / claim / DRP, terminal finality, 70 unit + 8 invariant tests; tag `v0.2.0-m2` |
+| **M3 — Testnet Deployment + Handover (20%)** | in flight | Base Sepolia deploy script + dev variant, deployment guide, gas report, verification checklist, handover docs |
 
 ## Prerequisites
 
@@ -45,23 +45,26 @@ git clone <repo-url> sawaswap-settlement
 cd sawaswap-settlement
 git submodule update --init --recursive
 forge build
-forge test -vvv
+forge test --no-match-path "test/invariants/*"   # 70 unit / integration tests
+forge test --match-path "test/invariants/*"      # 8 invariant-suite tests (7 properties + smoke)
 ```
 
-Expected output: `forge build` reports `Compiler run successful!` with zero warnings;
-`forge test` reports `24 tests passed, 0 failed` (20 unit/integration + 4 invariants).
-
-To run only the invariant suite:
-
-```sh
-forge test --match-path "test/invariants/*" -vvv
-```
+Expected: `forge build` reports `Compiler run successful!` with zero warnings; both `forge test`
+invocations report all tests passing.
 
 To run the formatter check:
 
 ```sh
 forge fmt --check
 ```
+
+For a gas report:
+
+```sh
+forge test --gas-report --no-match-path "test/invariants/*"
+```
+
+See [`gas-report.md`](./gas-report.md) for per-function gas measurements with USD cost estimates.
 
 ## Repository layout
 
@@ -70,33 +73,52 @@ src/
 ├── Settlement.sol           # main contract (non-upgradeable, immutable post-deploy)
 ├── types/Types.sol          # State enum, Direction enum, PoIInput, Transaction, TimeWindows
 ├── libraries/STID.sol       # pure library for STID (transaction ID) derivation
-└── interfaces/IDRP.sol      # frozen DRP boundary interface (M2 mock harness target)
+└── interfaces/IDRP.sol      # frozen DRP boundary interface
 test/
-├── Settlement.t.sol         # 20 unit / integration tests
-├── mocks/MockERC20.sol      # minimal ERC-20 mock for tests
+├── Settlement.t.sol         # 70 unit / integration tests across sections 6.1–6.10
+├── mocks/
+│   ├── MockERC20.sol        # minimal ERC-20 mock used as escrow asset in tests
+│   ├── MockDRP.sol          # configurable DRP harness (frozen-interface stub per §C.3.7)
+│   └── MaliciousMockDRP.sol # reentrancy-attempt variant exercising the nonReentrant boundary
 └── invariants/
-    ├── SettlementHandler.sol      # bounded driver
-    └── SettlementInvariants.t.sol # 4 invariant properties
+    ├── SettlementHandler.sol      # bounded handler driving the full M2 transition surface
+    └── SettlementInvariants.t.sol # 7 invariant properties P1–P7 + the deterministic wiring smoke test
 script/
-└── Deploy.s.sol             # Base Sepolia deployment (M3)
+├── Deploy.s.sol             # canonical M3 deploy — admin pinned to the canonical wallet via hard require
+└── DeployDev.s.sol          # Developer-side dev variant for throwaway pre-validation deploys
 ```
 
-## M1 scope at a glance
+Top-level documentation:
 
-Implemented:
+- [`DEPLOYMENT.md`](./DEPLOYMENT.md) — third-party-reproducible canonical deploy guide (§D.2.4 D10–D12).
+- [`VERIFICATION.md`](./VERIFICATION.md) — six post-deployment verification checks (§D.2.4 D13).
+- [`gas-report.md`](./gas-report.md) — per-function gas + deployment cost with USD estimates (§D.2.4 D11 / §C.3.6).
+- [`HANDOVER.md`](./HANDOVER.md) — §B.3 bullet 4 written no-residual-access attestation at M3 delivery (§D.2.4 D13).
+- [`TESTING.md`](./TESTING.md) — testing methodology, property catalogue, per-milestone test mappings.
 
-- `commitPoI(PoIInput)` — creates a transaction record, locks TW1 / TW2 / TW3 at PoI per §C.3.3.
-- `getTransaction(stid)` / `transactionExists(stid)` / `getNonce(originator)` — read accessors.
-- `getDefaultTimeWindows()` / `getRailPairTW1(railPairId)` — config accessors.
-- `setDefaultTimeWindows(...)` / `setRailPairProfile(...)` — admin-restricted setters under the
-  Parameter Configuration Carve-Out (§C.3.7).
+## Deploying to Base Sepolia
 
-Stubbed (revert `NotImplementedM1`) — to land in M2:
+Read [`DEPLOYMENT.md`](./DEPLOYMENT.md) for the step-by-step canonical deploy guide. The guide is
+written third-party-reproducible per §B.3 / §E.4 — a competent third party who has not interacted
+with the Developer can read the repository, install the environment, and execute the deploy.
 
-- `submitPoR`, `submitClaim`, `updateClaim`, `invokeDRP`, `settle`, `reverse`.
+The canonical deploy is run by the Client from the Client's own wallet (per §B.3). Per the
+Client's 2026-05-26 pinning, the canonical admin address is
+`0x434F2A01CccAEcFAa884b42e7c72e46D69ecB76e`; `Deploy.s.sol` enforces this via a hard `require`
+and will revert on any other admin. Base Mainnet deployment is excluded from Part 1 per §C.3.5.
 
-Production-deployment provisions in §E of the Agreement are gated to a separate phase beyond Part 1
-and are not enforced for the testnet build.
+## Verification
+
+After the canonical deploy, the [`VERIFICATION.md`](./VERIFICATION.md) checklist walks six checks
+per §D.2.4: reproducible build, deployment-state validation, `commitPoI` happy path, PoR-Settled,
+TW1 escalation + DRP outcome, and the TW3 default-reverse path. Each check is shell-paste-ready
+with explicit expected outputs and pass / fail criteria.
+
+## Testing methodology
+
+[`TESTING.md`](./TESTING.md) is the authoritative testing-methodology document — taxonomy, tooling,
+the per-milestone test mappings (§D.2.2 M1, §D.2.3 M2, §D.2.4 M3), the P1–P7 property catalogue
+with v0.11.2 clause anchors, coverage targets, and CI integration notes.
 
 ## Network targets
 
