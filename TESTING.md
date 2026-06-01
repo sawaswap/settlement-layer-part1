@@ -207,12 +207,24 @@ M2 invariant additions, all landed (P3 / P5 / P6 in the catalogue above):
 - P6 DRP single-invocation: `drpInvoked` is set only within the `invokeDRP` transition; a second
   `invokeDRP` reverts.
 
-**M3 (forward)** — at least six post-deployment verification checks on Base Sepolia, including:
+## M3 acceptance test mapping (§D.2.4)
 
-- Independent third-party clean-clone reproducibility (§D.3.3 acceptance check).
-- Round-trip a `commitPoI` call against the deployed contract.
-- Storage and event verification via `cast`.
-- Gas report for all Part 1 protocol actions.
+M3 is deployment + handover (D10–D13). The verification surface is six checks against the
+canonical Base Sepolia deployment plus the existing unit / integration / invariant suite. The
+verification checklist itself lives in [`VERIFICATION.md`](./VERIFICATION.md), the gas report in
+[`gas-report.md`](./gas-report.md), and the canonical deploy procedure in
+[`DEPLOYMENT.md`](./DEPLOYMENT.md).
+
+| §D.2.4 area | Artefact | Coverage |
+|---|---|---|
+| D10 — Base Sepolia deployment | `script/Deploy.s.sol` + `DEPLOYMENT.md` | canonical script with hard-required canonical admin (`0x434F2A01...`) via constructor; deploys `MockDRP` + `Settlement`; third-party-reproducible per §B.3 / §E.4 |
+| D11 — Gas report | `gas-report.md` | deployment cost (live measurement + Base mainnet estimate at illustrative gas / ETH-USD); per-function gas for `commitPoI` / `submitPoR` / `pokeTW1` / `submitClaim` / `updateClaim` / `invokeDRP` / `expireTW2` / `expireTW3`; end-to-end lifecycle cost for happy / DRP / default-reverse paths |
+| D12 — Documentation | `README.md`, `DEPLOYMENT.md`, `TESTING.md` | repo overview + quick start; step-by-step canonical deploy; testing methodology + property catalogue + per-milestone mappings |
+| D13 — Handover | `VERIFICATION.md` + `HANDOVER.md` (§B.3 bullet 4 written no-residual-access attestation) | six verification checks: clean-clone build + test, deployment-state read, `commitPoI` round-trip, PoR → Settled, TW1 escalation → DRP outcome, `expireTW3` default-reverse; plus written attestation on-chain-verifiable via VERIFICATION.md Check 2 |
+
+The six VERIFICATION.md checks exercise the §D.2.3 D4–D9 surface end-to-end against the deployed
+canonical instance, complementing the in-repo unit / integration / invariant coverage with live
+on-chain reproduction.
 
 ## Running the suites
 
