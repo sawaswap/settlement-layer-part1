@@ -143,6 +143,54 @@ contract SettlementTest is Test {
         settlement.setDefaultTimeWindows(0, DEFAULT_TW2, DEFAULT_TW3);
     }
 
+    // ─── 2b. KRAIT-003 (audit LOW) — TW2/TW3 upper bounds enforced ────────────────────────────────
+
+    function test_Configuration_RevertsOnTW2AboveMax() public {
+        uint64 maxTW2 = settlement.MAX_TW2(); // cache before prank/expectRevert — external read consumes them
+        vm.prank(admin);
+        vm.expectRevert(Settlement.TimeWindowTooLong.selector);
+        settlement.setDefaultTimeWindows(DEFAULT_TW1, maxTW2 + 1, DEFAULT_TW3);
+    }
+
+    function test_Configuration_RevertsOnTW3AboveMax() public {
+        uint64 maxTW3 = settlement.MAX_TW3(); // cache before prank/expectRevert — external read consumes them
+        vm.prank(admin);
+        vm.expectRevert(Settlement.TimeWindowTooLong.selector);
+        settlement.setDefaultTimeWindows(DEFAULT_TW1, DEFAULT_TW2, maxTW3 + 1);
+    }
+
+    /// @dev The documented ceilings themselves are valid (the bound is inclusive: `> MAX` reverts).
+    function test_Configuration_AllowsExactMaxBounds() public {
+        uint64 maxTW2 = settlement.MAX_TW2();
+        uint64 maxTW3 = settlement.MAX_TW3();
+        vm.prank(admin);
+        settlement.setDefaultTimeWindows(DEFAULT_TW1, maxTW2, maxTW3);
+
+        TimeWindows memory tw = settlement.getDefaultTimeWindows();
+        assertEq(tw.tw2, maxTW2, "TW2 at the ceiling is accepted");
+        assertEq(tw.tw3, maxTW3, "TW3 at the ceiling is accepted");
+    }
+
+    function test_Deployment_RevertsOnTW2AboveMax() public {
+        vm.expectRevert(Settlement.TimeWindowTooLong.selector);
+        new Settlement(
+            IERC20(address(usdc)),
+            IDRP(address(drp)),
+            admin,
+            TimeWindows({tw1: DEFAULT_TW1, tw2: uint64(36 hours) + 1, tw3: DEFAULT_TW3})
+        );
+    }
+
+    function test_Deployment_RevertsOnTW3AboveMax() public {
+        vm.expectRevert(Settlement.TimeWindowTooLong.selector);
+        new Settlement(
+            IERC20(address(usdc)),
+            IDRP(address(drp)),
+            admin,
+            TimeWindows({tw1: DEFAULT_TW1, tw2: DEFAULT_TW2, tw3: uint64(72 hours) + 1})
+        );
+    }
+
     // ─── 3. State enumeration ────────────────────────────────────────────────────────────────────
 
     function test_StateEnumeration_OrderingMatches() public pure {
@@ -1144,6 +1192,46 @@ contract SettlementTest is Test {
         assertFalse(txn.drpInvoked, "drpInvoked stays false on reentrancy-blocked attempt");
     }
 
+    /// @dev Audit item 7: closes the cross-function reentrancy gap. The OZ ReentrancyGuard is a
+    ///      single contract-wide flag, so re-entering a DIFFERENT `nonReentrant` function mid-
+    ///      `invokeDRP` must also be blocked — not just same-function re-entry. Here the malicious
+    ///      DRP re-enters via `pokeTW1`; the guard fires before `pokeTW1`'s own state precondition,
+    ///      so the revert is `ReentrancyGuardReentrantCall` (not an `InvalidState`), proving the
+    ///      protection is function-agnostic.
+    function test_InvokeDRP_NonReentrant_BlocksCrossFunctionReentryViaPokeTW1() public {
+        MaliciousMockDRP maliciousDrp = new MaliciousMockDRP();
+        maliciousDrp.setReentryTarget(MaliciousMockDRP.Target.PokeTW1);
+        Settlement settlementMal = new Settlement(
+            IERC20(address(usdc)),
+            IDRP(address(maliciousDrp)),
+            admin,
+            TimeWindows({tw1: DEFAULT_TW1, tw2: DEFAULT_TW2, tw3: DEFAULT_TW3})
+        );
+        maliciousDrp.setSettlement(address(settlementMal));
+
+        usdc.mint(originator, DEFAULT_AMOUNT);
+        vm.prank(originator);
+        usdc.approve(address(settlementMal), DEFAULT_AMOUNT);
+
+        vm.prank(originator);
+        bytes32 stid = settlementMal.commitPoI(_defaultInput());
+        vm.warp(block.timestamp + DEFAULT_TW1 + 1);
+        vm.prank(stranger);
+        settlementMal.pokeTW1(stid);
+        vm.prank(claimant);
+        settlementMal.submitClaim(stid, _defaultClaimData());
+
+        // invokeDRP → maliciousDrp.resolve → pokeTW1 (a different nonReentrant fn). The guard blocks
+        // it with ReentrancyGuardReentrantCall, which propagates out and reverts the whole call.
+        vm.prank(claimant);
+        vm.expectRevert(ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+        settlementMal.invokeDRP(stid);
+
+        Transaction memory txn = settlementMal.getTransaction(stid);
+        assertEq(uint8(txn.state), uint8(State.EscalationL1), "state remains EscalationL1 - revert rolled back");
+        assertFalse(txn.drpInvoked, "drpInvoked stays false on cross-function reentrancy-blocked attempt");
+    }
+
     // ─── 7. Zero-amount revert ───────────────────────────────────────────────────────────────────
 
     function test_CommitPoI_RevertsOnZeroAmount() public {
@@ -1171,6 +1259,53 @@ contract SettlementTest is Test {
         vm.prank(originator);
         vm.expectRevert(Settlement.InvalidAddress.selector);
         settlement.commitPoI(input);
+    }
+
+    // ─── 7b. KRAIT-001 (audit HIGH) — reflexive / structural party addresses rejected ─────────────
+
+    /// @dev The original PoC: `beneficiary == address(this)` marked the transaction Settled and the
+    ///      `safeTransfer` to the contract itself was a same-address no-op, permanently trapping
+    ///      escrow. `commitPoI` must now reject it up front — no record is created, no escrow pulled.
+    function test_CommitPoI_RevertsOnSelfBeneficiary() public {
+        PoIInput memory input = _defaultInput();
+        input.beneficiary = address(settlement);
+
+        vm.prank(originator);
+        vm.expectRevert(Settlement.InvalidAddress.selector);
+        settlement.commitPoI(input);
+    }
+
+    function test_CommitPoI_RevertsOnSelfEligibleClaimant() public {
+        PoIInput memory input = _defaultInput();
+        input.eligibleClaimant = address(settlement);
+
+        vm.prank(originator);
+        vm.expectRevert(Settlement.InvalidAddress.selector);
+        settlement.commitPoI(input);
+    }
+
+    function test_CommitPoI_RevertsOnBeneficiaryEqualsEscrowToken() public {
+        PoIInput memory input = _defaultInput();
+        input.beneficiary = address(usdc);
+
+        vm.prank(originator);
+        vm.expectRevert(Settlement.InvalidAddress.selector);
+        settlement.commitPoI(input);
+    }
+
+    /// @dev Regression for the escrow-conservation invariant the PoC broke: a rejected self-
+    ///      beneficiary commit must leave the originator's balance untouched (no escrow pulled).
+    function test_CommitPoI_SelfBeneficiaryRejected_NoEscrowPulled() public {
+        uint256 balanceBefore = usdc.balanceOf(originator);
+
+        PoIInput memory input = _defaultInput();
+        input.beneficiary = address(settlement);
+        vm.prank(originator);
+        vm.expectRevert(Settlement.InvalidAddress.selector);
+        settlement.commitPoI(input);
+
+        assertEq(usdc.balanceOf(originator), balanceBefore, "no escrow may be pulled on a rejected commit");
+        assertEq(usdc.balanceOf(address(settlement)), 0, "settlement holds no escrow after a rejected commit");
     }
 
     // ─── 8. Getter ───────────────────────────────────────────────────────────────────────────────

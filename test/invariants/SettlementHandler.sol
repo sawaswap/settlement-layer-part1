@@ -80,6 +80,15 @@ contract SettlementHandler is Test {
         if (bene == address(0)) bene = address(0xBEEF);
         if (claimant == address(0)) claimant = address(0xC1A1);
         if (sender == address(0)) sender = address(0xCAFE);
+        // The fuzzer must not act AS the Settlement or escrow-token contract: `msg.sender ==
+        // address(this)` is unreachable for an external entry point in production (no code path
+        // self-calls `commitPoI`), and an originator of `address(settlement)` would make the
+        // reverse-path `safeTransfer` a same-address no-op, a model artifact — not a reachable
+        // state. Remap such senders to a realistic EOA so the escrow-conservation invariant (P3)
+        // is exercised over reachable states. The contract itself guards the reachable
+        // reflexive surface — `beneficiary` / `eligibleClaimant` (KRAIT-001) — which the fuzzer
+        // still exercises freely (those commits revert and are caught below).
+        if (sender == address(settlement) || sender == address(usdc)) sender = address(0xCAFE);
 
         // Fund and approve the random sender so the escrow pull succeeds. Done unconditionally —
         // even if the commit reverts on another precondition, the spare allowance is harmless.

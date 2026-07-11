@@ -130,6 +130,10 @@ setRailPairProfile(bytes32 railPairId, uint64 tw1)
 
 Calling either from a non-admin wallet reverts with `AccessControlUnauthorizedAccount(address,bytes32)` (the OpenZeppelin v5 access-control error, not one of this contract's custom errors).
 
+`setDefaultTimeWindows` enforces the documented window ceilings — TW2 ≤ 36h (`MAX_TW2`), TW3 ≤ 72h (`MAX_TW3`); an over-range value reverts `TimeWindowTooLong()`, a zero value reverts `InvalidTimeWindow()`.
+
+> **Rail-pair TW1 override — RESERVED, not consumed in Part 1.** `setRailPairProfile` / `getRailPairTW1` store and read a per-rail-pair TW1 value, but **nothing in Part 1 reads it**: `commitPoI` records the default `getDefaultTimeWindows().tw1` on every transaction and never consults a rail-pair override, and `PoIInput` carries no `railPairId` to key one off. The setter/getter exist so the admin surface stays stable ahead of the later Part that wires rail-pair selection into the commit input. Do not expect a rail-pair override to change a committed transaction's TW1 on this deployment. (KRAIT-002 audit correction.)
+
 ---
 
 ## 6. M2 stubs — expected reverts
