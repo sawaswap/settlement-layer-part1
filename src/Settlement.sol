@@ -30,6 +30,14 @@ contract Settlement is AccessControl, ReentrancyGuard {
     /// @dev Held by the Client multisignature wallet on production-bound deployments.
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
 
+    /// @notice Upper bound on the TW2 claim window (Types.sol / v0.11.2 §C.3.3 — TW2 ≤ 36h).
+    /// @dev KRAIT-003 (audit LOW): the documented ceiling is now enforced, not merely documented.
+    uint64 public constant MAX_TW2 = 36 hours;
+
+    /// @notice Upper bound on the TW3 DRP-resolution window (Types.sol / v0.11.2 §C.3.3 — TW3 ≤ 72h).
+    /// @dev KRAIT-003 (audit LOW): the documented ceiling is now enforced, not merely documented.
+    uint64 public constant MAX_TW3 = 72 hours;
+
     /// @notice ERC-20 token used as the escrow asset (USDC on the deployment chain).
     IERC20 public immutable USDC;
 
@@ -43,7 +51,12 @@ contract Settlement is AccessControl, ReentrancyGuard {
     /// @dev Default time-window configuration; overridable per rail-pair via {setRailPairProfile}.
     TimeWindows private _defaultTW;
 
-    /// @dev TW1 override per directional rail-pair profile (per §C.3.3).
+    /// @dev TW1 override store per directional rail-pair profile (per §C.3.3). RESERVED for a later
+    ///      Part: nothing in Part 1 consumes this — `commitPoI` records the default `_defaultTW.tw1`
+    ///      on every transaction and never consults a rail-pair override (`PoIInput` carries no
+    ///      `railPairId`). Kept as a settable/readable store so the interface is stable when the
+    ///      rail-pair mechanism is designed into the Part that adds `railPairId` to the commit input.
+    ///      (KRAIT-002 audit MEDIUM: the earlier NatSpec claimed Part-1 consumption; corrected here.)
     mapping(bytes32 railPairId => uint64 tw1) private _railPairTW1;
 
     /// @dev Settlement-layer transaction store. Keyed by deterministic STID (see {STID.derive}).
@@ -107,6 +120,12 @@ contract Settlement is AccessControl, ReentrancyGuard {
     error TransactionNotFound();
     error NotImplementedM1();
     error InvalidTimeWindow();
+
+    /// @notice Thrown when a configured TW2 or TW3 exceeds its documented ceiling (`MAX_TW2` / `MAX_TW3`).
+    /// @dev KRAIT-003 (audit LOW): distinguishes an out-of-range window from a zero window
+    ///      (`InvalidTimeWindow`). TW1 carries no documented upper bound and is not checked here.
+    error TimeWindowTooLong();
+
     error InvalidAddress();
 
     /// @notice Thrown when an operation is attempted from an incompatible state.
@@ -189,6 +208,9 @@ contract Settlement is AccessControl, ReentrancyGuard {
         if (defaultTimeWindows.tw1 == 0 || defaultTimeWindows.tw2 == 0 || defaultTimeWindows.tw3 == 0) {
             revert InvalidTimeWindow();
         }
+        if (defaultTimeWindows.tw2 > MAX_TW2 || defaultTimeWindows.tw3 > MAX_TW3) {
+            revert TimeWindowTooLong();
+        }
 
         USDC = usdc;
         DRP = drp;
@@ -214,7 +236,17 @@ contract Settlement is AccessControl, ReentrancyGuard {
     /// @return stid The derived 32-byte SawaSwap Transaction ID.
     function commitPoI(PoIInput calldata input) external nonReentrant returns (bytes32 stid) {
         if (input.escrowAmount == 0) revert ZeroAmount();
-        if (input.beneficiary == address(0) || input.eligibleClaimant == address(0)) {
+        // KRAIT-001 (audit HIGH): reject reflexive / structural party addresses. Escrow that would
+        // resolve to the zero address, the Settlement contract itself, or the escrow-token contract
+        // is permanently trapped — a `safeTransfer` to `address(this)` is a same-address no-op and
+        // `address(0)` / the token contract cannot forward it. `beneficiary` receives on Settled and
+        // `eligibleClaimant` drives claim / DRP, so both are guarded against 0 and `address(this)`,
+        // and `beneficiary` additionally against the escrow token.
+        if (
+            input.beneficiary == address(0) || input.eligibleClaimant == address(0)
+                || input.beneficiary == address(this) || input.eligibleClaimant == address(this)
+                || input.beneficiary == address(USDC)
+        ) {
             revert InvalidAddress();
         }
 
@@ -298,12 +330,18 @@ contract Settlement is AccessControl, ReentrancyGuard {
     ///      new defaults. Restricted to `ADMIN_ROLE` per §C.3.7 Parameter Configuration Carve-Out.
     function setDefaultTimeWindows(uint64 tw1, uint64 tw2, uint64 tw3) external onlyRole(ADMIN_ROLE) {
         if (tw1 == 0 || tw2 == 0 || tw3 == 0) revert InvalidTimeWindow();
+        if (tw2 > MAX_TW2 || tw3 > MAX_TW3) revert TimeWindowTooLong();
         _defaultTW = TimeWindows({tw1: tw1, tw2: tw2, tw3: tw3});
         emit TimeWindowsConfigured(tw1, tw2, tw3, msg.sender);
     }
 
     /// @notice Sets or updates the TW1 override for a rail-pair identifier.
-    /// @dev Restricted to `ADMIN_ROLE` per §C.3.7. Rail-pair selection is consumed by `commitPoI` in M2.
+    /// @dev Restricted to `ADMIN_ROLE` per §C.3.7. RESERVED for a later Part — the stored override is
+    ///      NOT consumed by `commitPoI` in Part 1 (which records the default `_defaultTW.tw1`);
+    ///      `PoIInput` has no `railPairId` for the override to key off. The setter/getter exist so the
+    ///      admin surface is stable ahead of the Part that wires rail-pair selection into the commit
+    ///      input. (KRAIT-002 audit MEDIUM: corrects the earlier "consumed by `commitPoI` in M2" claim
+    ///      per Option B — documentation fix, no ABI change.)
     function setRailPairProfile(bytes32 railPairId, uint64 tw1) external onlyRole(ADMIN_ROLE) {
         if (tw1 == 0) revert InvalidTimeWindow();
         _railPairTW1[railPairId] = tw1;
@@ -337,7 +375,7 @@ contract Settlement is AccessControl, ReentrancyGuard {
         // forge-lint: disable-next-line(incorrect-shift)
         // forge-lint: disable-next-line(unsafe-typecast)
         // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp > uint256(txn.committedAt) + uint256(txn.tw1)) revert WindowExpired();
+        if (block.timestamp > _tw1Deadline(txn)) revert WindowExpired();
         if (msg.sender != txn.eligibleClaimant) revert NotPoRSubmitter();
 
         _porHash[stid] = keccak256(porData);
@@ -366,7 +404,7 @@ contract Settlement is AccessControl, ReentrancyGuard {
         // forge-lint: disable-next-line(incorrect-shift)
         // forge-lint: disable-next-line(unsafe-typecast)
         // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp <= uint256(txn.committedAt) + uint256(txn.tw1)) revert EscalationNotDue();
+        if (block.timestamp <= _tw1Deadline(txn)) revert EscalationNotDue();
 
         State previous = txn.state;
         txn.state = State.EscalationL1;
@@ -400,7 +438,7 @@ contract Settlement is AccessControl, ReentrancyGuard {
         // forge-lint: disable-next-line(incorrect-shift)
         // forge-lint: disable-next-line(unsafe-typecast)
         // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp > uint256(txn.committedAt) + uint256(txn.tw1) + uint256(txn.tw2)) {
+        if (block.timestamp > _tw2Deadline(txn)) {
             revert WindowExpired();
         }
         if (_claimHash[stid] != bytes32(0)) revert ClaimAlreadyExists();
@@ -430,7 +468,7 @@ contract Settlement is AccessControl, ReentrancyGuard {
         // forge-lint: disable-next-line(incorrect-shift)
         // forge-lint: disable-next-line(unsafe-typecast)
         // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp > uint256(txn.committedAt) + uint256(txn.tw1) + uint256(txn.tw2)) {
+        if (block.timestamp > _tw2Deadline(txn)) {
             revert WindowExpired();
         }
         if (_claimHash[stid] == bytes32(0)) revert NoClaimToUpdate();
@@ -463,7 +501,7 @@ contract Settlement is AccessControl, ReentrancyGuard {
         // forge-lint: disable-next-line(incorrect-shift)
         // forge-lint: disable-next-line(unsafe-typecast)
         // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp <= uint256(txn.committedAt) + uint256(txn.tw1) + uint256(txn.tw2)) {
+        if (block.timestamp <= _tw2Deadline(txn)) {
             revert EscalationNotDue();
         }
         if (_claimHash[stid] != bytes32(0)) revert ClaimPending();
@@ -494,11 +532,10 @@ contract Settlement is AccessControl, ReentrancyGuard {
         if (msg.sender != txn.eligibleClaimant) revert NotEligibleClaimant();
         if (_claimHash[stid] == bytes32(0)) revert NoClaim();
         if (txn.drpInvoked) revert DRPAlreadyInvoked();
-        uint256 absoluteExpiry = uint256(txn.committedAt) + uint256(txn.tw1) + uint256(txn.tw2) + uint256(txn.tw3);
         // forge-lint: disable-next-line(incorrect-shift)
         // forge-lint: disable-next-line(unsafe-typecast)
         // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp > absoluteExpiry) revert WindowExpired();
+        if (block.timestamp > _tw3Deadline(txn)) revert WindowExpired();
 
         // Effects: transition state + set drpInvoked BEFORE the external DRP call.
         State previous = txn.state;
@@ -547,11 +584,10 @@ contract Settlement is AccessControl, ReentrancyGuard {
             revert InvalidState(uint8(State.EscalationL1), uint8(txn.state));
         }
         if (_claimHash[stid] == bytes32(0)) revert NoClaim();
-        uint256 absoluteExpiry = uint256(txn.committedAt) + uint256(txn.tw1) + uint256(txn.tw2) + uint256(txn.tw3);
         // forge-lint: disable-next-line(incorrect-shift)
         // forge-lint: disable-next-line(unsafe-typecast)
         // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp <= absoluteExpiry) revert EscalationNotDue();
+        if (block.timestamp <= _tw3Deadline(txn)) revert EscalationNotDue();
 
         _finalizeReversed(stid);
     }
@@ -629,10 +665,29 @@ contract Settlement is AccessControl, ReentrancyGuard {
         // forge-lint: disable-next-line(incorrect-shift)
         // forge-lint: disable-next-line(unsafe-typecast)
         // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp <= uint256(txn.committedAt) + uint256(txn.tw1)) return;
+        if (block.timestamp <= _tw1Deadline(txn)) return;
 
         State previous = txn.state;
         txn.state = State.EscalationL1;
         emit StateChanged(stid, previous, State.EscalationL1);
+    }
+
+    // ─── Window-boundary helpers ─────────────────────────────────────────────────────────────────
+
+    /// @dev Absolute TW1 deadline (`committedAt + tw1`) — end of the execution window. Centralised
+    ///      here (audit item 6) so the six lifecycle functions share one boundary computation and
+    ///      cannot desync; the `uint256` widening matches the comparisons against `block.timestamp`.
+    function _tw1Deadline(Transaction storage txn) private view returns (uint256) {
+        return uint256(txn.committedAt) + uint256(txn.tw1);
+    }
+
+    /// @dev Absolute TW2 deadline (`committedAt + tw1 + tw2`) — end of the claim window.
+    function _tw2Deadline(Transaction storage txn) private view returns (uint256) {
+        return uint256(txn.committedAt) + uint256(txn.tw1) + uint256(txn.tw2);
+    }
+
+    /// @dev Absolute TW3 deadline (`committedAt + tw1 + tw2 + tw3`) — end of the full DRP envelope.
+    function _tw3Deadline(Transaction storage txn) private view returns (uint256) {
+        return uint256(txn.committedAt) + uint256(txn.tw1) + uint256(txn.tw2) + uint256(txn.tw3);
     }
 }

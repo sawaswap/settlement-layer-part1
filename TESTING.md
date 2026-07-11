@@ -139,6 +139,17 @@ Anchors §3 escrow [1] and §C.2.
 **Handler surface.** Full M2 surface — the balance changes on `commitPoI` (in) and on every
 terminal transition (out).
 
+**Audit note (KRAIT-001).** The reported escrow-conservation break was a *reflexive-party* commit:
+`beneficiary == address(this)` marks the transaction Settled but the `safeTransfer` to the contract
+itself is a same-address no-op, so escrow is trapped while the transaction reads terminal — P3
+violated. The default 256-run campaign missed it because the fuzzer dictionary never exercised
+reflexive addresses. `commitPoI` now rejects `beneficiary` / `eligibleClaimant == address(0)` /
+`address(this)` and `beneficiary == address(USDC)` up front (`InvalidAddress`), closing the reachable
+leg; the handler additionally no longer fuzzes `address(settlement)` / `address(USDC)` as the
+*originator*, since `msg.sender == address(this)` is unreachable for an external entry point in
+production (the reverse-leg analogue is a model artifact, not a reachable state). P3 now holds over
+reachable states, with dedicated `commitPoI` reflexive-address unit tests pinning the guard.
+
 ### P4 — Time windows locked at PoI
 
 **Statement.** For every committed STID, the stored `tw1` / `tw2` / `tw3` equal the defaults active
